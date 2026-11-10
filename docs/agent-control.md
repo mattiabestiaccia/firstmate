@@ -250,3 +250,25 @@ The empirical basis for each adapter's value is the `harness-adapters` skill's v
 - `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session.
 - `tests/fm-backend-rex.test.sh` and `tests/fm-backend-rex-smoke.test.sh` - the Rex classifier and absence proof against a stateful fake CLI and a private test server; [`docs/verification/runtime-backends.md`](verification/runtime-backends.md#rex) records the live `interrupt`, `exit`, endpoint-gone, and reclaim runs.
 - `tests/fm-backend-t3code.test.sh` - the t3code exit and relaunch refusals and the native interrupt against a fake T3 server.
+
+### Continue a native Claude launch after late consent
+
+`fm-control.sh <task-id> continue-native` submits the original launch record on
+the same hc endpoint after the human has completed native trust. It does not
+restart the worker or accept a prompt. The task must have the durable
+`state/<task-id>.native-delivery.json` created by the updated spawner.
+
+The command holds control and spawn locks, verifies the original metadata,
+brief and record hashes, lease, wiring and SessionStart generation, and requires
+an alive agent and empty composer. Only `not-sent` can advance. A durable
+`sending` claim precedes any input; errors or interruption after that claim
+remain ambiguous and cannot be retried automatically. A second invocation
+following `delivered` sends nothing. This is at-most-once submission, not proof
+that the worker completed or processed the brief exactly once.
+
+Older pending launches without the journal are refused. Matching text or a
+nearby inbox timestamp is not sufficient provenance; never synthesize a journal
+or remove the pending marker to bypass this refusal. Review recovery separately.
+The receipt and the original operational record must be retained until the task
+is reconciled. Normal record retention may expire an old record, in which case
+continuation refuses rather than creating a replacement.

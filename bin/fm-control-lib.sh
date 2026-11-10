@@ -50,13 +50,14 @@ fm_control_verbs() {
 interrupt
 exit
 pause
+continue-native
 relaunch
 EOF
 }
 
 fm_control_verb_allowed() {  # <verb>
   case "${1-}" in
-    interrupt|exit|pause|relaunch) return 0 ;;
+    interrupt|exit|pause|continue-native|relaunch) return 0 ;;
   esac
   return 1
 }

@@ -3251,8 +3251,8 @@ SH
 }
 
 test_native_claude_handoff_never_reads_the_trust_store() {
-  local dir id=native1 holder tag out rc=0 variant input_before
-  for variant in ready blocked fresh; do
+  local dir id=native1 holder tag out rc=0 variant input_before hook record drift changed
+  for variant in ready blocked fresh ambiguous interrupted legacy; do
     dir=$(new_case "native-$variant" "$id")
     add_ship_task "$dir" "$id" codex
     mkdir -p "$dir/home/config" "$dir/user-home"
@@ -3296,7 +3296,7 @@ case "$1" in
     jq -n --arg name "$command" --arg cwd "$(cat "$D/cwd")" --arg home "$(cat "$D/hometag")" --arg id "$(cat "$D/id")" '{address:"t2",state:"live",labels:{"firstmate.home":$home,"firstmate.task":("fm-"+$id)},foreground:{name:$name,argv:[$name],pid:1,cwd:$cwd}}'
     ;;
   read)
-    if [ "$(cat "$D/command")" = claude ] && [ "$(cat "$D/variant")" = blocked ]; then
+    if [ "$(cat "$D/command")" = claude ] && [[ "$(cat "$D/variant")" = blocked || "$(cat "$D/variant")" = ambiguous || "$(cat "$D/variant")" = interrupted || "$(cat "$D/variant")" = legacy ]]; then
       printf 'Trust this folder?\n1. Yes\n2. No\n'
     else
       printf '────────────────────────\n❯\n────────────────────────\n'
@@ -3304,11 +3304,12 @@ case "$1" in
     ;;
   send)
     printf '%s\n' "$last" >> "$D/hc-input"
+    if [ "$(cat "$D/variant")" = fail-send ] && [[ "$last" = *'Firstmate operational input waiting'* ]]; then exit 1; fi
     case "$last" in
       /quit|/exit) printf zsh > "$D/command" ;;
       '. '*launch.*)
         printf claude > "$D/command"
-        if [ "$(cat "$D/variant")" != blocked ]; then
+        if [[ "$(cat "$D/variant")" = ready || "$(cat "$D/variant")" = fresh ]]; then
           hook=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$(cat "$D/cwd")/.claude/settings.local.json")
           bash -c "$hook"
         fi
@@ -3329,7 +3330,7 @@ SH
       out=$(FM_CLAUDE_READY_POLLS=1 FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" relaunch --harness claude --note 'continue synthetic work') || rc=$?
     fi
     [ "$(cat "$dir/user-home/.claude.json")" = 'deliberately invalid JSON' ] || fail 'native mode altered trust store'
-    if [ "$variant" != blocked ]; then
+    if [ "$variant" = ready ] || [ "$variant" = fresh ]; then
       [ "$rc" = 0 ] || fail "$out"
       assert_contains "$(cat "$dir/fake/hc-input")" 'Firstmate operational input waiting' 'native ready receives brief doorbell'
       [ "$(meta_field "$dir" "$id" hc_terminal)" = t2 ] || fail 'relaunch lost hc identity'
@@ -3351,6 +3352,86 @@ SH
       assert_not_contains "$(cat "$dir/fake/hc-input")" 'Firstmate operational input waiting' 'unready native runtime receives no brief'
       [ -f "$dir/home/state/$id.meta" ] || fail 'pending consent lost task record'
       [ -d "$dir/wt" ] || fail 'pending consent lost copy'
+      # Consent arrives after the spawning process has exited. The original
+      # persistent record must be used exactly once, without a new launch.
+      if [ "$variant" = legacy ]; then
+        rm "$dir/home/state/$id.native-delivery.json"
+        input_before=$(cat "$dir/fake/hc-input")
+        rc=0
+        out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+        [ "$rc" != 0 ] || fail 'legacy pending accepted without provenance'
+        [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'legacy pending sent input'
+        continue
+      fi
+      printf ready > "$dir/fake/variant"
+      hook=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$dir/wt/.claude/settings.local.json")
+      bash -c "$hook"
+      if [ "$variant" = blocked ]; then
+        for drift in generation wiring brief meta lease; do
+          case "$drift" in
+            generation) changed="$dir/home/state/$id.claude-native-ready" ;;
+            wiring) changed="$dir/wt/.claude/settings.local.json" ;;
+            brief) changed="$dir/home/data/$id/launch-brief.md" ;;
+            meta) changed="$dir/home/state/$id.meta" ;;
+            lease) changed="$dir/fakebin/treehouse" ;;
+          esac
+          cp "$changed" "$dir/drift.original"
+          if [ "$drift" = lease ]; then
+            sed 's/fixture-lease/foreign-lease/g' "$changed" > "$dir/foreign"
+            cat "$dir/foreign" > "$changed"
+          else
+            printf ' ' >> "$changed"
+          fi
+          input_before=$(cat "$dir/fake/hc-input")
+          rc=0
+          out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+          [ "$rc" != 0 ] || fail "$drift drift accepted"
+          [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail "$drift drift sent input"
+          cat "$dir/drift.original" > "$changed"
+        done
+      fi
+      record=$(jq -r .record "$dir/home/state/$id.native-delivery.json")
+      cp "$record" "$dir/record.original"
+      printf drift >> "$record"
+      input_before=$(cat "$dir/fake/hc-input")
+      rc=0
+      out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+      [ "$rc" != 0 ] || fail 'record drift accepted'
+      [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'record drift submitted input'
+      cp "$dir/record.original" "$record"
+      if [ "$variant" = interrupted ]; then
+        # Model a process lost immediately after the durable sending claim.
+        jq '.state="sending"' "$dir/home/state/$id.native-delivery.json" > "$dir/interrupted.json"
+        mv "$dir/interrupted.json" "$dir/home/state/$id.native-delivery.json"
+        input_before=$(cat "$dir/fake/hc-input")
+        rc=0
+        out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+        [ "$rc" != 0 ] || fail 'interrupted delivery retried'
+        [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'interrupted delivery sent input'
+        continue
+      fi
+      if [ "$variant" = ambiguous ]; then
+        printf fail-send > "$dir/fake/variant"
+        rc=0
+        out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+        [ "$rc" != 0 ] || fail 'failed submission reported successful'
+        [ "$(jq -r .state "$dir/home/state/$id.native-delivery.json")" = sending ] || fail 'ambiguous delivery lost claim'
+        input_before=$(cat "$dir/fake/hc-input")
+        rc=0
+        out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+        [ "$rc" != 0 ] || fail 'ambiguous submission retried'
+        [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'ambiguous submission duplicated input'
+        continue
+      fi
+      rc=0
+      out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || rc=$?
+      [ "$rc" = 0 ] || fail "$out"
+      [ "$(jq -r .state "$dir/home/state/$id.native-delivery.json")" = delivered ] || fail 'late delivery not recorded'
+      [ ! -e "$dir/home/state/$id.native-trust-pending" ] || fail 'successful continuation kept steering blocked'
+      input_before=$(cat "$dir/fake/hc-input")
+      out=$(FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" continue-native) || fail "$out"
+      [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'double continuation duplicated input'
+
     fi
   done
   pass 'native Claude handoff preserves the store, gates the brief and retains pending consent'

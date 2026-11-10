@@ -7738,7 +7738,11 @@ case "$LAUNCH" in
     exit 1
   }
   if [ "$HARNESS" = claude ] && [ "$CLAUDE_TRUST_MODE" = native ]; then
-    CLAUDE_NATIVE_DOORBELL=$brief_doorbell
+    # Persist the exact original record before starting the runtime.
+    # shellcheck source=bin/fm-native-delivery-lib.sh
+    . "$SCRIPT_DIR/fm-native-delivery-lib.sh"
+    fm_native_prepare "$STATE" "$ID" "$STATE/$ID.meta" "$BRIEF" "$brief_doorbell" || exit 1
+    printf '%s\n' not-sent > "$STATE/$ID.native-trust-pending" || exit 1
     LAUNCH=${LAUNCH//__BRIEFDOORBELL__/}
   else
     LAUNCH=${LAUNCH//__BRIEFDOORBELL__/"$(shell_quote "$brief_doorbell")"}
@@ -8198,7 +8202,11 @@ if [ "$HARNESS" = claude ] && [ "$CLAUDE_TRUST_MODE" = native ]; then
     sleep 0.5
   done
   if [ "$native_ready" = 1 ]; then
-    native_delivery=$(fm_backend_send_text_submit "$BACKEND" "$T" "$CLAUDE_NATIVE_DOORBELL" 1 0.4 0 "$W") || native_delivery=unknown
+    if fm_native_deliver "$STATE" "$ID" "$STATE/$ID.meta" "$BRIEF" "$FM_HOME" "$BACKEND" "$T" "$W"; then
+      native_delivery=empty
+    else
+      native_delivery=$(cat "$STATE/$ID.native-trust-pending")
+    fi
   else
     native_delivery=not-sent
   fi

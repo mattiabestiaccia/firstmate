@@ -4,6 +4,7 @@
 #
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
+#        fm-control.sh <task-id> continue-native
 #        fm-control.sh <task-id> pause --note-file <path>
 #        fm-control.sh <task-id> relaunch [--resume-paused] [--harness <name>] [--model <name>]
 #                                         [--effort <level>] [--account <entry>]
@@ -1341,6 +1342,18 @@ do_relaunch() {
 # --- verbs ------------------------------------------------------------------
 
 case "$VERB" in
+  continue-native)
+    [ "$HARNESS" = claude ] && [ "$BACKEND" = hc ] && [ "$KIND" != secondmate ] || die "native continuation requires an hc Claude worker"
+    # Use a subshell to release the spawn lock on every exit, including errors.
+    (
+      native_lock="$STATE/.spawn-$ID.lock"
+      fm_lock_try_acquire "$native_lock" || exit 1
+      trap 'fm_lock_release "$native_lock"' EXIT
+      # shellcheck source=bin/fm-native-delivery-lib.sh
+      . "$SCRIPT_DIR/fm-native-delivery-lib.sh"
+      fm_native_deliver "$STATE" "$ID" "$META" "$DATA/$ID/launch-brief.md" "$FM_HOME" "$BACKEND" "$T" "$LABEL"
+    ) || die "native continuation refused or ambiguous; preserve task and inspect"
+    ;;
   interrupt)
     state=$(agent_state)
     case "$state" in
