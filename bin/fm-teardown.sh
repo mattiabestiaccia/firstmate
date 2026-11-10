@@ -222,9 +222,10 @@
 #     (bin/fm-task-checkpoint.py verify). A refusal changes nothing. Every
 #     other guard is unchanged: task preservation, the durable-lease check, the
 #     scout report and captain-call gate, and a ship's landed-work checks. The
-#     pause, checkpoint and native-delivery records are removed last, only
-#     after the backlog transition succeeds. Without this flag a paused task is
-#     refused exactly as before.
+#     pause, checkpoint and native-delivery records are removed with the task's
+#     other state files, once the copy and its lease are returned and before
+#     the backlog transition. Without this flag a paused task is refused
+#     exactly as before.
 #   --no-prune keeps other Done rows in place; persisted in close/replay.
 #     Retained captain-held rows do not run done and need no prune control.
 #   --skip-orphan-sweep excludes only the account-wide orphan remote-job sweep.
@@ -4328,6 +4329,14 @@ rm -f "$STATE/$ID.treehouse-lease.json" "$STATE/$ID.claude-native-ready" "$STATE
   "$STATE/$ID.pr-register-timed-out" \
   "$STATE/.$ID.branch-outcome-index" \
   "$STATE/.secondmate-relaunch-$ID" "$STATE/.secondmate-relaunch-bound-$ID"
+# --retire-paused: the records only a pause leaves behind go with the rest of
+# the task's state. The copy and its lease are already returned, so the pause
+# protects nothing, and a failed backlog transition below must not strand a
+# pause record with no task record beside its pending close.
+if [ "$RETIRE_PAUSED" = 1 ]; then
+  rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous" \
+    "$STATE/$ID.checkpoint.json" "$STATE/$ID.native-delivery.json"
+fi
 # kiro's per-task home is a directory (its relocated KIRO_HOME holds the hook
 # agent config, the trust setting, and this task's sessions), so it needs a
 # recursive removal rather than the file rm above.
@@ -4391,13 +4400,6 @@ else
     echo "error: $ID's endpoint and local copy are cleaned up, but its task record could not be removed ($FM_BACKLOG_TRANSITION_ERROR)" >&2
     exit 1
   fi
-fi
-# --retire-paused: the records only a pause leaves behind go last, still under
-# the task locks and only once the backlog transition above has succeeded. A
-# failed transition keeps them beside its pending-close record.
-if [ "$RETIRE_PAUSED" = 1 ]; then
-  rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous" \
-    "$STATE/$ID.checkpoint.json" "$STATE/$ID.native-delivery.json"
 fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0

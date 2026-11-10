@@ -178,17 +178,30 @@ with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
   assert (h.data/ID/'report.md').exists()
   r=h.teardown('--retire-paused','--skip-orphan-sweep');assert r.returncode!=0 and 'is not paused' in r.stderr,r.stderr
  passed('ii: valid preconditions retire the task, return the lease, remove the pause records and close the row')
- # The pause records are removed only after the backlog transition, so a failed transition keeps them.
- h=Home(tmp,'transition-fails');(h.H/'fail-done').write_text('');r=h.teardown('--retire-paused','--skip-orphan-sweep')
- assert r.returncode==1 and 'its backlog item could not be closed atomically (synthetic done failure)' in r.stderr,(r.returncode,r.stderr)
- left=sorted(p.name[len(ID)+1:] for p in h.state.iterdir() if p.name.startswith(ID+'.'));assert left==sorted(PAUSE_ONLY+['backlog-close']),left
- assert '- [ ] '+ID+' ' in (h.data/'backlog.md').read_text() and json.loads((h.H/'treehouse-rows.json').read_text())==[]
- passed('a failed backlog transition keeps the pause records beside the pending-close record')
+ # The pause records go with the other state files, before the backlog transition: a failed transition
+ # leaves only the usual pending-close record, byte for byte what an ordinary teardown leaves, and it replays.
+ markers={}
+ for name,paused,args in [('transition-fails',True,('--retire-paused',)),('transition-fails-ordinary',False,())]:
+  h=Home(tmp,name) if paused else Home(tmp,name,paused=None)
+  (h.H/'fail-done').write_text('');r=h.teardown(*args,'--skip-orphan-sweep')
+  assert r.returncode==1 and 'its backlog item could not be closed atomically (synthetic done failure)' in r.stderr,(name,r.returncode,r.stderr)
+  left=sorted(p.name[len(ID)+1:] for p in h.state.iterdir() if p.name.startswith(ID+'.'))
+  assert left==['backlog-close']+([] if paused else ['native-delivery.json','paused.previous']),(name,left)
+  assert '- [ ] '+ID+' ' in (h.data/'backlog.md').read_text() and json.loads((h.H/'treehouse-rows.json').read_text())==[]
+  markers[name]=(h.state/(ID+'.backlog-close')).read_text().replace(str(h.H),'<home>')
+ assert markers['transition-fails']==markers['transition-fails-ordinary'],markers
+ h=Home(tmp,'transition-replays');(h.H/'fail-done').write_text('');r=h.teardown('--retire-paused','--skip-orphan-sweep');assert r.returncode==1,r.stderr
+ (h.H/'fail-done').unlink()
+ code='source "$1/bin/fm-tasks-axi-lib.sh"; source "$1/bin/fm-backlog-transition-lib.sh"; fm_backlog_close_marker_replay "$HOME/state" "$HOME/state/$2.backlog-close" "$HOME/data" || { printf "%s" "$FM_BACKLOG_TRANSITION_ERROR" >&2; exit 10; }; printf "%s" "$FM_BACKLOG_CLOSE_REPLAY_RESULT"'
+ r=run(['/bin/bash','-c',code,'fixture',str(R),ID],h.env,cwd=h.H);assert r.returncode==0 and r.stdout=='closed',(r.returncode,r.stdout,r.stderr)
+ assert '- [x] '+ID+' ' in (h.data/'backlog.md').read_text() and [p.name for p in h.state.iterdir() if p.name.startswith(ID+'.')]==[]
+ passed('a failed backlog transition leaves no pause record, only the usual pending-close record, and it replays')
  source=TEARDOWN.read_text();transition=source.index('fm_backlog_atomic_transition "$BACKLOG_TRANSITION" "$STATE/$ID.meta"')
- removal=source.index('rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous"');assert transition<removal
+ removal=source.index('rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous"')
+ assert source.index('teardown_treehouse_return "$WT" "$PROJ" "worktree"')<source.index('rm -f "$STATE/$ID.treehouse-lease.json"')<removal<transition
  assert source.count('rm -f "$STATE/$ID.paused"')==1 and source.count('"$STATE/$ID.paused.previous"')==1
  for gate in ['fm_task_preserve_guard "$CONFIG"','fm_task_handoff_verify "$META"','fm_backend_validate_task_endpoint "$META" "$ID" || exit 1']:
   assert source.index(gate)<source.index('TEARDOWN_RETIRE_ENDPOINT=$(fm_backend_agent_state')
  assert source.index('TEARDOWN_RETIRE_ENDPOINT=$(fm_backend_agent_state')<source.index('if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then')
- passed('static: pause records removed after the backlog transition; proof sits after the existing gates and before the scout gate')
+ passed('static: pause records removed after the lease return and before the backlog transition; proof sits after the existing gates and before the scout gate')
 print(json.dumps({'passed':len(results),'cases':results,'limits':'fake hc, treehouse, lsof and ps on synthetic homes, real tasks-axi; no real Herdr Core, Treehouse, harness or orphan sweep'},indent=2))
