@@ -352,6 +352,12 @@ if ! fm_task_id_creation_valid "$RAW_ID"; then
   die "'$RAW_ID' is not a valid task id"
 fi
 ID=$RAW_ID
+# shellcheck source=bin/fm-task-preserve-lib.sh
+. "$SCRIPT_DIR/fm-task-preserve-lib.sh"
+case "$VERB" in
+  exit|relaunch)
+    fm_task_preserve_guard "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" "$ID" "$VERB" || exit 1 ;;
+esac
 # Supervision lease guard: lifecycle control is overlap territory between the
 # two Pi supervision actors; refuse while the OTHER actor holds this task's
 # live lease (contract: bin/fm-lease-lib.sh; no-op in homes without leases).

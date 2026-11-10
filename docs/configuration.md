@@ -3748,3 +3748,30 @@ A live lock, a missing `lsof`, any failed check, or any other fetch failure keep
 Every wait, retry, and removal is printed to stderr, and a successful recovery also prints one `recovered:` summary line to stdout so a session-start refresh - which discards fleet-sync stderr and relays only stdout - still surfaces it.
 
 The shared staleness proof lives in `bin/fm-lock-lib.sh`, which both `fm-teardown.sh` and `fm-fleet-sync.sh` use.
+
+## Task resource preservation (local migration patch)
+
+`config/task-preservation/<task-id>` is a presence-only operator retention flag,
+separate from a captain hold (which retains backlog decisions, not resources).
+With a flag present, `fm-teardown.sh` refuses even `--force`, `fm-control.sh`
+refuses `exit` and `relaunch`, and `fm-spawn.sh` refuses reuse/replacement of the
+ID, including an ID with no metadata. A dangling flag symlink also refuses;
+unsafe/unreadable configuration directories fail closed. Flag content is an
+operator explanation, never executed. There is no automatic expiry or command
+option that bypasses retention.
+
+Create the directory and exact ID flag only with lifecycle writers quiescent.
+Revocation requires an explicit operator decision followed by removal of that
+exact flag; it does not itself run cleanup, resume, or remove other gates. Do not
+use captain-hold resolution or a fabricated `paused` marker for revocation.
+Activation/revocation is not serialized against already executing commands, and
+cannot retroactively cancel a command past the guard. Batch spawn may still
+perform its batch-level watcher check and act on unprotected IDs.
+
+This guard protects those entrypoints in this home, not arbitrary filesystem,
+backend, Treehouse, shell, `fm-send`, or other-home operations. It does not stop a
+running worker or prevent its writes; `interrupt`, `pause`, and `continue-native`
+retain their existing gates. Protecting an orphan terminal without metadata also
+requires an operational prohibition on direct terminal closure. Main and branch
+use the same guard; secondmate homes do not inherit these task-specific flags.
+Never change configuration overrides to evade a retained task.

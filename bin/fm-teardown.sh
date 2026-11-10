@@ -555,6 +555,10 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+teardown_require_source "$SCRIPT_DIR/fm-task-preserve-lib.sh"
+# shellcheck source=bin/fm-task-preserve-lib.sh
+. "$SCRIPT_DIR/fm-task-preserve-lib.sh"
+fm_task_preserve_guard "$CONFIG" "$ID" teardown || exit 1
 fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
