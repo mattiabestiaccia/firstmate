@@ -85,6 +85,10 @@ Use `relaunch --resume-paused --harness <name> --note-file <path>` to continue d
 Changed files or ownership refuse resume without resetting, cleaning or stashing anything.
 The previous pause note is retained after a successful replacement.
 
+A paused task whose agent has already ended and whose useful work is saved elsewhere is closed with `fm-teardown.sh <id> --retire-paused`, the only exit from a pause that does not relaunch it.
+It is refused with `--force`, on a task that is not paused, while the endpoint reads anything but dead or missing, and when the checkpoint no longer verifies against the copy; a refusal changes nothing.
+It relaxes no other teardown guard, so a scout still needs its report and its completed captain-call gate; [`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the exact conditions.
+
 The hc adapter refuses a stop proof when process inspection is unreadable.
 Its relaunch reuses an existing, positively agent-free terminal; a missing or unreachable hc endpoint remains a recovery refusal.
 The stop proof covers the recorded runtime and its inspected foreground process group, not arbitrary external writers or detached processes on the same user account.

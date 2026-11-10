@@ -209,7 +209,22 @@
 # leased home releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
-# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record] [--skip-orphan-sweep] [--no-prune]
+# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record] [--skip-orphan-sweep] [--no-prune] [--retire-paused]
+#   --retire-paused retires a paused ship or scout whose agent has already
+#     ended; it is the only exit from a pause that does not relaunch the task
+#     (docs/agent-control.md "Pausing a Treehouse task"). It is refused with
+#     --force and on a task that is not paused. Under the task locks and after
+#     the record and endpoint checks it then requires all of: state/<id>.paused
+#     is a regular file whose first line is exactly `paused`; the recorded
+#     endpoint reads dead or missing (bin/fm-backend.sh's
+#     fm_backend_agent_state; every other state refuses); and
+#     state/<id>.checkpoint.json still verifies against the copy
+#     (bin/fm-task-checkpoint.py verify). A refusal changes nothing. Every
+#     other guard is unchanged: task preservation, the durable-lease check, the
+#     scout report and captain-call gate, and a ship's landed-work checks. The
+#     pause, checkpoint and native-delivery records are removed last, only
+#     after the backlog transition succeeds. Without this flag a paused task is
+#     refused exactly as before.
 #   --no-prune keeps other Done rows in place; persisted in close/replay.
 #     Retained captain-held rows do not run done and need no prune control.
 #   --skip-orphan-sweep excludes only the account-wide orphan remote-job sweep.
@@ -550,6 +565,7 @@ FORCE=
 LEGACY_RECORD_GIVEN=0
 SKIP_ORPHAN_SWEEP=0
 TEARDOWN_NO_PRUNE=0
+RETIRE_PAUSED=0
 shift
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -557,6 +573,7 @@ while [ "$#" -gt 0 ]; do
     --legacy-record) LEGACY_RECORD_GIVEN=1 ;;
     --skip-orphan-sweep) SKIP_ORPHAN_SWEEP=1 ;;
     --no-prune) TEARDOWN_NO_PRUNE=1 ;;
+    --retire-paused) RETIRE_PAUSED=1 ;;
     *)
       echo "error: invalid teardown request" >&2
       exit 2
@@ -564,6 +581,12 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+# Retiring a paused task proves its agent ended and its copy is unchanged;
+# --force exists to skip proofs, so the two never combine.
+if [ "$RETIRE_PAUSED" = 1 ] && [ "$FORCE" = --force ]; then
+  echo "error: --retire-paused cannot be combined with --force; nothing was changed" >&2
+  exit 2
+fi
 teardown_require_source "$SCRIPT_DIR/fm-task-preserve-lib.sh"
 # shellcheck source=bin/fm-task-preserve-lib.sh
 . "$SCRIPT_DIR/fm-task-preserve-lib.sh"
@@ -591,7 +614,14 @@ fm_lease_guard "$ID" "teardown (fm-teardown)"
 
 META="$STATE/$ID.meta"
 if [ -e "$STATE/$ID.paused" ] || [ -L "$STATE/$ID.paused" ]; then
-  echo "error: task $ID is paused; teardown would discard retained work. Resume and reconcile it first." >&2
+  if [ "$RETIRE_PAUSED" != 1 ]; then
+    echo "error: task $ID is paused; teardown would discard retained work. Resume and reconcile it first." >&2
+    exit 1
+  fi
+elif [ "$RETIRE_PAUSED" = 1 ]; then
+  # Never a synonym for an ordinary teardown. The pause record is proved again
+  # under the task locks before anything is retired.
+  echo "error: task $ID is not paused; --retire-paused retires only a paused task. Nothing was changed." >&2
   exit 1
 fi
 TREEHOUSE_PROJECT_LOCK=
@@ -697,6 +727,12 @@ TEARDOWN_META_KIND=$(fm_meta_get "$META" kind)
 # Retiring a persistent secondmate is main's alone in both postures; the kind
 # is read under the metadata lock (role partition: bin/fm-lease-lib.sh).
 [ "$TEARDOWN_META_KIND" != secondmate ] || fm_lease_forbid_branch "secondmate retirement (fm-teardown)"
+# Pause covers ship and scout tasks only (bin/fm-control.sh), and a secondmate's
+# remote retirement below runs before the paused-task proof.
+if [ "$RETIRE_PAUSED" = 1 ] && [ "$TEARDOWN_META_KIND" = secondmate ]; then
+  echo "error: --retire-paused supports ship and scout tasks only; nothing was changed" >&2
+  exit 1
+fi
 # A secondmate's endpoint-liveness episodes (bin/fm-secondmate-liveness-lib.sh)
 # serialize on this lock; retirement holds it to the end so no probe or relaunch
 # can act on the route mid-teardown, and its relaunch ledger and park marker are
@@ -1359,6 +1395,39 @@ fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 BASE_BRANCH=$(grep '^base_branch=' "$META" | cut -d= -f2- || true)
+
+# --retire-paused (see the Usage block): the paused-task proof. It runs under
+# the control, metadata and Treehouse project locks, after the durable-lease
+# check and the record and endpoint validation above, and before the first
+# destructive step, so every refusal leaves the pause, the lease, the copy,
+# the endpoint and the backlog item exactly as they were. Only the
+# recovery-grade classifier's dead and missing count as an ended agent; a
+# windowless record names no endpoint and reads missing, as it does for a
+# legacy record below.
+if [ "$RETIRE_PAUSED" = 1 ]; then
+  if [ -L "$STATE/$ID.paused" ] || [ ! -f "$STATE/$ID.paused" ] \
+     || [ "$(head -n 1 "$STATE/$ID.paused" 2>/dev/null)" != paused ]; then
+    echo "REFUSED: task $ID's pause record $STATE/$ID.paused is not a regular file whose first line is exactly 'paused', so its stop was never confirmed; --retire-paused retires only a completed pause. Nothing was changed." >&2
+    exit 1
+  fi
+  if [ "$TEARDOWN_WINDOWLESS" = 1 ]; then
+    TEARDOWN_RETIRE_ENDPOINT=missing
+  else
+    TEARDOWN_RETIRE_ENDPOINT=$(fm_backend_agent_state "$BACKEND" "$T")
+  fi
+  case "$TEARDOWN_RETIRE_ENDPOINT" in
+    dead|missing) ;;
+    *)
+      echo "REFUSED: paused task $ID's recorded endpoint reads '$TEARDOWN_RETIRE_ENDPOINT', not confidently dead or agent-less; --retire-paused is refused while an agent may still be bound to it. Nothing was changed." >&2
+      echo "Reconcile the endpoint first (bin/fm-crew-state.sh $ID), then retry, or continue the task with bin/fm-control.sh $ID relaunch --resume-paused." >&2
+      exit 1
+      ;;
+  esac
+  python3 "$SCRIPT_DIR/fm-task-checkpoint.py" verify "$WT" "$STATE/$ID.checkpoint.json" || {
+    echo "REFUSED: paused task $ID's checkpoint $STATE/$ID.checkpoint.json does not verify against its copy $WT, so the copy is not proved unchanged since the pause; review it before retiring. Nothing was changed." >&2
+    exit 1
+  }
+fi
 
 # A record accepted as a legacy incarnation (no spawn_gen, and either
 # --legacy-record given or the record is windowless) may be torn down only
@@ -4322,6 +4391,13 @@ else
     echo "error: $ID's endpoint and local copy are cleaned up, but its task record could not be removed ($FM_BACKLOG_TRANSITION_ERROR)" >&2
     exit 1
   fi
+fi
+# --retire-paused: the records only a pause leaves behind go last, still under
+# the task locks and only once the backlog transition above has succeeded. A
+# failed transition keeps them beside its pending-close record.
+if [ "$RETIRE_PAUSED" = 1 ]; then
+  rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous" \
+    "$STATE/$ID.checkpoint.json" "$STATE/$ID.native-delivery.json"
 fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0

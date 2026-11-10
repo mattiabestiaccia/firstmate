@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Task handoff retains Treehouse ownership across a stopped worker.
 # A pause marker blocks steering, automatic relaunch and teardown. Only an
-# explicit fm-control relaunch --resume-paused consumes it after success.
+# explicit fm-control relaunch --resume-paused consumes it after success, or
+# fm-teardown --retire-paused once the agent has ended and the copy verifies.
 # Callers provide the existing metadata, Treehouse and lock library functions.
 fm_task_lease_holder() {  # <home> <id>
   local home hash

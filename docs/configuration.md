@@ -3776,3 +3776,10 @@ retain their existing gates. Protecting an orphan terminal without metadata also
 requires an operational prohibition on direct terminal closure. Main and branch
 use the same guard; secondmate homes do not inherit these task-specific flags.
 Never change configuration overrides to evade a retained task.
+
+`fm-teardown.sh <task-id> --retire-paused` does not bypass this guard: a
+preserved task is refused before its pause is examined, so the flag is removed
+first, by the same explicit operator decision. The option composes with
+`--skip-orphan-sweep` and `--no-prune` and is refused with `--force`;
+[`agent-control.md`](agent-control.md#pausing-a-treehouse-task) describes when a
+paused task may be retired.
