@@ -242,28 +242,41 @@ JSON
 # project-root entry is a human's explicit "No, disable" answer, recorded in the SAME store their own
 # interactive sessions read. A spawn must never flip that to true on their
 # behalf: doing so would grant every later interactive session in that
-# checkout silent external-file inclusion the human declined. The whole
-# registration refuses instead, and the store - including the worktree entry,
-# which is never reached - must come back byte-for-byte unchanged.
+# checkout silent external-file inclusion the human declined. Workspace trust
+# must still register, preserving the refusal on both entries, including when
+# a reused worktree entry carries obsolete approval. Repeat with and without
+# existing workspace trust to prove that trust and import consent are separate.
 test_project_root_entry_declined_external_imports_is_not_overridden() {
-  local rec store out before after
-  rec=$(make_case project-decline)
-  read_case "$rec"
-  store="$CONFIG/.claude.json"
-  cat > "$store" <<JSON
-{"hasCompletedOnboarding":true,"projects":{"$PROJ":{"hasTrustDialogAccepted":true,"hasClaudeMdExternalIncludesApproved":false,"hasClaudeMdExternalIncludesWarningShown":true,"allowedTools":["Read"]}}}
+  local rec store out before after trusted key
+  for trusted in true false; do
+    rec=$(make_case "project-decline-$trusted")
+    read_case "$rec"
+    store="$CONFIG/.claude.json"
+    cat > "$store" <<JSON
+{"hasCompletedOnboarding":true,"projects":{"$PROJ":{"hasTrustDialogAccepted":$trusted,"hasClaudeMdExternalIncludesApproved":false,"hasClaudeMdExternalIncludesWarningShown":true,"allowedTools":["Read"]},"$WT":{"hasTrustDialogAccepted":false,"hasClaudeMdExternalIncludesApproved":true,"hasClaudeMdExternalIncludesWarningShown":true,"allowedTools":["Bash"]},"/unrelated":{"hasTrustDialogAccepted":false,"allowedTools":["Edit"]}}}
 JSON
-  before=$(cat "$store")
-  out=$(run_trust "$CONFIG" "$WT" "$PROJ")
-  expect_code 1 $? "a project that already declined external imports must be refused: $out"
-  assert_contains "$out" "declined external CLAUDE.md imports" \
-    "the refusal did not name the declined-consent reason"
-  assert_contains "$out" "approve the imports dialog interactively" \
-    "the refusal did not name the recovery"
-  after=$(cat "$store")
-  [ "$before" = "$after" ] || fail "the store was modified despite the refusal"
-  assert_not_trusted "$store" "$WT" "the worktree entry was registered despite the refusal"
-  pass "fm-claude-trust.sh: refuses to override a project's declined external-imports consent"
+    out=$(run_trust "$CONFIG" "$WT" "$PROJ")
+    expect_code 0 $? "declined imports must not prevent workspace trust: $out"
+    assert_trusted "$store" "$PROJ" "the project did not gain workspace trust"
+    assert_trusted "$store" "$WT" "the worktree did not gain workspace trust"
+    for key in "$PROJ" "$WT"; do
+      assert_store_value "$store" false "import refusal was lost" \
+        projects "$key" hasClaudeMdExternalIncludesApproved
+      assert_store_value "$store" true "the answered import decision was lost" \
+        projects "$key" hasClaudeMdExternalIncludesWarningShown
+    done
+    assert_store_value "$store" '["Read"]' "project permissions changed" projects "$PROJ" allowedTools
+    assert_store_value "$store" '["Bash"]' "worktree permissions changed" projects "$WT" allowedTools
+    assert_store_value "$store" '{"hasTrustDialogAccepted":false,"allowedTools":["Edit"]}' \
+      "an unrelated project changed" projects /unrelated
+    assert_store_value "$store" true "unrelated onboarding changed" hasCompletedOnboarding
+    before=$(store_value "$store")
+    out=$(run_trust "$CONFIG" "$WT" "$PROJ")
+    expect_code 0 $? "repeat registration with declined imports failed: $out"
+    after=$(store_value "$store")
+    [ "$before" = "$after" ] || fail "repeat registration changed the declined decision"
+  done
+  pass "fm-claude-trust.sh: registers workspace trust while preserving declined imports"
 }
 
 # Claude Code's own default project entry carries BOTH external-imports flags as
