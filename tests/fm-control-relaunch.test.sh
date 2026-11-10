@@ -3250,9 +3250,172 @@ SH
   pass "fm-control exit removes the dialog file before it releases the control lock"
 }
 
+test_native_claude_handoff_never_reads_the_trust_store() {
+  local dir id=native1 holder tag out rc=0 variant input_before
+  for variant in ready blocked fresh; do
+    dir=$(new_case "native-$variant" "$id")
+    add_ship_task "$dir" "$id" codex
+    mkdir -p "$dir/home/config" "$dir/user-home"
+    printf native > "$dir/home/config/claude-trust-mode"
+    printf auto > "$dir/home/config/claude-permission-mode"
+    # A malformed synthetic store would make the legacy helper refuse.
+    printf 'deliberately invalid JSON' > "$dir/user-home/.claude.json"
+    holder="fm-$(printf '%s' "$dir/home" | git hash-object --stdin)-$id"
+    tag=$(FM_HOME="$dir/home" bash -c '. "$1/bin/fm-backend.sh"; fm_backend_source hc; fm_backend_hometag' _ "$ROOT")
+    sed -i.bak 's/^window=.*/window=fmses:t2/' "$dir/home/state/$id.meta"
+    printf 'backend=hc\nhc_session=fmses\nhc_terminal=t2\ntreehouse_lease_holder=%s\ntreehouse_lease_id=fixture-lease\n' "$holder" >> "$dir/home/state/$id.meta"
+    printf 'task=%s\nhome=%s\n' "$id" "$dir/home" > "$dir/.fm-slot-owner"
+    printf '{}\n' > "$TMP_ROOT/treehouse-state.json"
+    printf codex > "$dir/fake/command"
+    printf '%s' "$tag" > "$dir/fake/hometag"
+    printf '%s' "$id" > "$dir/fake/id"
+    printf '%s' "$variant" > "$dir/fake/variant"
+    cat > "$dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  'get --lease '*) printf '%s\n' '{"path":"$dir/wt","lease_holder":"$holder","lease_id":"fixture-lease"}'; exit 0 ;;
+  'status --json') ;;
+  *) exit 99 ;;
+esac
+printf '%s\n' '[{"path":"$dir/wt","status":"leased","lease_holder":"$holder","lease_id":"fixture-lease"}]'
+SH
+    cat > "$dir/fakebin/hc" <<'SH'
+#!/usr/bin/env bash
+set -eu
+D=$FM_FAKE_DIR
+last=''
+for a in "$@"; do last=$a; done
+case "$1" in
+  --version) echo 'hc 0.1.14' ;;
+  server) echo '{}' ;;
+  connect) IFS= read -r request; echo '{"jsonrpc":"2.0","id":1,"result":{"generation":1}}' ;;
+  ls) echo '{"terminals":[]}' ;;
+  run) echo '{"address":"t2"}' ;;
+  get)
+    command=$(cat "$D/command")
+    jq -n --arg name "$command" --arg cwd "$(cat "$D/cwd")" --arg home "$(cat "$D/hometag")" --arg id "$(cat "$D/id")" '{address:"t2",state:"live",labels:{"firstmate.home":$home,"firstmate.task":("fm-"+$id)},foreground:{name:$name,argv:[$name],pid:1,cwd:$cwd}}'
+    ;;
+  read)
+    if [ "$(cat "$D/command")" = claude ] && [ "$(cat "$D/variant")" = blocked ]; then
+      printf 'Trust this folder?\n1. Yes\n2. No\n'
+    else
+      printf '────────────────────────\n❯\n────────────────────────\n'
+    fi
+    ;;
+  send)
+    printf '%s\n' "$last" >> "$D/hc-input"
+    case "$last" in
+      /quit|/exit) printf zsh > "$D/command" ;;
+      '. '*launch.*)
+        printf claude > "$D/command"
+        if [ "$(cat "$D/variant")" != blocked ]; then
+          hook=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$(cat "$D/cwd")/.claude/settings.local.json")
+          bash -c "$hook"
+        fi
+        ;;
+    esac
+    printf '{"started":true,"wait":{"status":"working"}}\n'
+    ;;
+  keys) printf '{}\n' ;;
+  *) exit 90 ;;
+esac
+SH
+    chmod +x "$dir/fakebin/treehouse" "$dir/fakebin/hc"
+    rc=0
+    if [ "$variant" = fresh ]; then
+      rm "$dir/home/state/$id.meta"
+      out=$(FM_CLAUDE_READY_POLLS=1 FM_HC_BIN="$dir/fakebin/hc" run_spawn "$dir" "$id" "$dir/proj" --harness claude --backend hc --scout) || rc=$?
+    else
+      out=$(FM_CLAUDE_READY_POLLS=1 FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" relaunch --harness claude --note 'continue synthetic work') || rc=$?
+    fi
+    [ "$(cat "$dir/user-home/.claude.json")" = 'deliberately invalid JSON' ] || fail 'native mode altered trust store'
+    if [ "$variant" != blocked ]; then
+      [ "$rc" = 0 ] || fail "$out"
+      assert_contains "$(cat "$dir/fake/hc-input")" 'Firstmate operational input waiting' 'native ready receives brief doorbell'
+      [ "$(meta_field "$dir" "$id" hc_terminal)" = t2 ] || fail 'relaunch lost hc identity'
+      if [ "$variant" = fresh ]; then
+        [ -f "$dir/home/state/$id.treehouse-lease.json" ] || fail 'new spawn lost lease receipt'
+        [ "$(meta_field "$dir" "$id" treehouse_lease_holder)" = "$holder" ] || fail 'new spawn lost lease owner'
+      fi
+      if [ "$variant" = ready ]; then
+        printf ' ' >> "$dir/wt/.claude/settings.local.json"
+        input_before=$(cat "$dir/fake/hc-input")
+        rc=0
+        out=$(FM_CLAUDE_READY_POLLS=1 FM_HC_BIN="$dir/fakebin/hc" run_control "$dir" "$id" relaunch --harness claude --note 'check wiring') || rc=$?
+        [ "$rc" != 0 ] || fail 'modified wiring was removed'
+        [ "$(cat "$dir/fake/hc-input")" = "$input_before" ] || fail 'wiring drift stopped the old agent before refusing'
+      fi
+    else
+      [ "$rc" != 0 ] || fail 'unanswered native trust passed'
+      [ -f "$dir/home/state/$id.native-trust-pending" ] || fail "$out"
+      assert_not_contains "$(cat "$dir/fake/hc-input")" 'Firstmate operational input waiting' 'unready native runtime receives no brief'
+      [ -f "$dir/home/state/$id.meta" ] || fail 'pending consent lost task record'
+      [ -d "$dir/wt" ] || fail 'pending consent lost copy'
+    fi
+  done
+  pass 'native Claude handoff preserves the store, gates the brief and retains pending consent'
+}
+
+test_pause_retains_work_and_requires_explicit_resume() {
+  local dir id=paused1 holder out rc=0
+  dir=$(new_case pause "$id")
+  add_ship_task "$dir" "$id" codex
+  printf codex > "$dir/fake/command"
+  printf codex > "$dir/fake/becomes"
+  holder="fm-$(printf '%s' "$dir/home" | git hash-object --stdin)-$id"
+  printf 'treehouse_lease_holder=%s\ntreehouse_lease_id=fixture-lease\n' "$holder" >> "$dir/home/state/$id.meta"
+  printf 'task=%s\nhome=%s\n' "$id" "$dir/home" > "$dir/.fm-slot-owner"
+  printf '{}\n' > "$TMP_ROOT/treehouse-state.json"
+  mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+[ "\$*" = 'status --json' ] || exit 99
+printf '%s\n' '[{"path":"$dir/wt","status":"leased","lease_holder":"$holder","lease_id":"fixture-lease"}]'
+SH
+  chmod +x "$dir/fakebin/treehouse"
+  printf 'unsaved\n' > "$dir/wt/unsaved.txt"
+  out=$(run_control "$dir" "$id" pause --note 'resume on Codex, preserve unsaved.txt') || fail "$out"
+  [ "$(head -n 1 "$dir/home/state/$id.paused")" = paused ] || fail 'pause not durable'
+  [ "$(cat "$dir/wt/unsaved.txt")" = unsaved ] || fail 'pause lost untracked file'
+  [ -f "$dir/home/state/$id.meta" ] || fail 'pause removed task'
+  out=$(FM_HOME="$dir/home" HOME="$dir/user-home" PATH="$dir/fakebin:$PATH" FM_FAKE_DIR="$dir/fake" "$ROOT/bin/fm-crew-state.sh" "$id") || fail "$out"
+  assert_contains "$out" 'state: paused' 'fleet view must show the durable pause'
+  if FM_HOME="$dir/home" HOME="$dir/user-home" PATH="$dir/fakebin:$PATH" FM_FAKE_DIR="$dir/fake" "$ROOT/bin/fm-send.sh" "fm-$id" 'continue now' > "$dir/send-refused" 2>&1; then
+    fail 'ordinary steering reached a paused task'
+  fi
+  assert_contains "$(cat "$dir/send-refused")" paused 'steer refusal must name pause'
+  if FM_HOME="$dir/home" HOME="$dir/user-home" PATH="$dir/fakebin:$PATH" FM_FAKE_DIR="$dir/fake" "$ROOT/bin/fm-teardown.sh" "$id" > "$dir/teardown-refused" 2>&1; then
+    fail 'teardown accepted a paused task'
+  fi
+  assert_contains "$(cat "$dir/teardown-refused")" paused 'teardown refusal must name pause'
+  out=$(run_control "$dir" "$id" relaunch --harness codex --note continue) || rc=$?
+  [ "$rc" != 0 ] || fail 'implicit resume accepted'
+  printf 'drift\n' >> "$dir/wt/unsaved.txt"
+  rc=0
+  out=$(run_control "$dir" "$id" relaunch --resume-paused --harness codex --note continue) || rc=$?
+  [ "$rc" != 0 ] || fail 'resume ignored checkpoint drift'
+  printf 'unsaved\n' > "$dir/wt/unsaved.txt"
+  out=$(run_control "$dir" "$id" relaunch --resume-paused --harness codex --note continue) || fail "$out"
+  [ ! -e "$dir/home/state/$id.paused" ] || fail 'successful resume left pause active'
+  [ -f "$dir/home/state/$id.paused.previous" ] || fail 'resume lost pause note'
+  [ "$(cat "$dir/wt/unsaved.txt")" = unsaved ] || fail 'resume lost untracked file'
+  pass 'pause keeps task/copy and rejects automatic resume or changed files'
+}
+
+
+if [ "${FM_TEST_NATIVE_HANDOFF_ONLY:-0}" = 1 ]; then
+  test_native_claude_handoff_never_reads_the_trust_store
+  test_pause_retains_work_and_requires_explicit_resume
+  exit 0
+fi
+test_native_claude_handoff_never_reads_the_trust_store
+
 test_relaunch_off_opencode_removes_tracked_wiring
 test_exit_and_relaunch_remove_the_dialog_file
 test_exit_removes_the_dialog_file_before_releasing_the_lock
+
+test_pause_retains_work_and_requires_explicit_resume
+
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_keeps_a_recorded_pr_valid_for_the_merge_poll
 test_relaunch_refuses_before_exit_when_the_composer_holds_pending_text

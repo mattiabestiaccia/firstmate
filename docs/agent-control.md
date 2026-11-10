@@ -15,7 +15,7 @@ The failure repeated across harnesses and homes, and the workaround (remember to
 
 `bin/fm-control-lib.sh` is the single executable owner of three capability tables, which have no side effects, so they can be read as a contract:
 
-- The **verb allowlist**: `interrupt`, `exit`, `relaunch`.
+- The **verb allowlist**: `interrupt`, `exit`, `pause`, `relaunch`.
   There is no arbitrary-text and no generic raw-key entry point.
   A caller either names an allowlisted verb or is refused.
 - **Per-harness mechanics**: the key that cancels a running turn, how many times it must be delivered, whether the composer needs clearing afterwards, the command that exits the agent, and which task kinds the adapter is verified to run.
@@ -69,6 +69,30 @@ It is not deterministic across the verified adapters: codex, grok, gemini, devin
 `relaunch` uses the brief on disk - not a harness-private session - as the durable instruction when the backend can prove the old agent stopped and the composer is empty; Devin on Herdr currently fails that composer check and refuses.
 T3 Code cannot host a fresh replacement agent in a thread, so `relaunch` refuses before stopping anything.
 A relaunch does take one session reference when the endpoint's own runtime recorded it - see [the relaunch transaction](#transactional-relaunch) - but that is a relaunch input, not a caller-facing verb.
+
+## Pausing a Treehouse task
+
+`fm-control.sh <id> pause --note-file <path>` stops a ship or scout and retains its exact Treehouse copy and durable lease.
+The task must already record a lease id and a home-scoped holder matching both Treehouse and the slot owner marker.
+Legacy process leases are not silently adopted: preserve the copy and provision ownership separately.
+The pause blocks ordinary steering, new dispatch under that id, automatic relaunch and teardown.
+An incomplete stop remains blocked rather than claiming the writer stopped.
+
+After stop, the checkpoint fingerprints HEAD, branch, index, tracked files and nonignored untracked files without copying their contents.
+Ignored files are left in place and are not inspected or backed up.
+The checkpoint detects drift; it is not a recoverable snapshot.
+Use `relaunch --resume-paused --harness <name> --note-file <path>` to continue deliberately.
+Changed files or ownership refuse resume without resetting, cleaning or stashing anything.
+The previous pause note is retained after a successful replacement.
+
+The hc adapter refuses a stop proof when process inspection is unreadable.
+Its relaunch reuses an existing, positively agent-free terminal; a missing or unreachable hc endpoint remains a recovery refusal.
+The stop proof covers the recorded runtime and its inspected foreground process group, not arbitrary external writers or detached processes on the same user account.
+Operational use still requires live validation of the installed harness and its background-task exit behavior.
+
+Claude and Pi generated wiring is fingerprinted for hc handoff, so user changes to that wiring stop the replacement instead of being deleted.
+Account selection, trust and permission settings remain specific to each adapter; no credentials or private conversation are transferred.
+The replacement receives the brief, progress note and retained instruction inbox.
 
 ## Transactional relaunch
 

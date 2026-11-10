@@ -155,6 +155,23 @@ test_control_interrupt_delivers_the_harness_keys() {
   pass "hc: fm-control interrupt delivers the harness's interrupt key"
 }
 
+test_control_exit_accepts_only_proven_stopped_shell() {
+  local tag out id=hcexit
+  setup_case exit-proof
+  tag=$(hometag_of)
+  write_terminal "$D" t2 live "fm-$id" "$tag" zsh /bin/zsh
+  mkdir -p "$HOMEDIR/state" "$HOMEDIR/data"
+  printf 'window=fmtest:t2\nendpoint_task_id=%s\nworktree=%s\nproject=%s\nharness=claude\nkind=scout\nbackend=hc\nhc_session=fmtest\nhc_terminal=t2\n' "$id" "$D" "$D" > "$HOMEDIR/state/$id.meta"
+  out=$(FAKE_HC_DIR=$D PATH="$FB:$PATH" FM_HC_BIN="$FB/hc" FM_HOME=$HOMEDIR FM_ROOT_OVERRIDE=$HOMEDIR "$FM_TEST_ROOT/bin/fm-control.sh" "$id" exit 2>&1) || fail "$out"
+  assert_contains "$out" already-stopped "a positively stopped hc task supports exit"
+  printf '#!/bin/sh\nexit 1\n' > "$FB/ps"
+  chmod +x "$FB/ps"
+  if FAKE_HC_DIR=$D PATH="$FB:$PATH" FM_HC_BIN="$FB/hc" FM_HOME=$HOMEDIR FM_ROOT_OVERRIDE=$HOMEDIR "$FM_TEST_ROOT/bin/fm-control.sh" "$id" exit > "$D/refused" 2>&1; then
+    fail "unreadable process table must refuse exit proof"
+  fi
+  pass "hc: control exit requires a positively stopped agent"
+}
+
 test_foreign_or_unlabeled_terminal_gets_no_input_and_no_close() {
   local tag
   setup_case foreign
@@ -203,6 +220,18 @@ test_agent_state_classifies_foreground_and_absence() {
   assert_equals "$out" "t1=alive t2=dead t3=missing t4=ambiguous t5=unreadable t6=unreadable t7=missing " \
     "agent_state over claude, shell, finished, other, no foreground, core error, not found"
   pass "hc: agent_state maps foreground, finished, not_found and core errors onto the shared vocabulary"
+}
+
+test_unreadable_process_group_never_proves_stopped() {
+  local tag out
+  setup_case ps-denied
+  tag=$(hometag_of)
+  write_terminal "$D" t2 live fm-a1 "$tag" zsh /bin/zsh
+  printf '#!/bin/sh\nexit 1\n' > "$FB/ps"
+  chmod +x "$FB/ps"
+  out=$(hc_shell 'fm_backend_agent_state hc fmtest:t2')
+  assert_equals "$out" unreadable "denied process inspection must not license a second writer"
+  pass "hc: denied process inspection refuses to prove a shell agent-free"
 }
 
 test_agent_state_reads_a_shell_wrappers_group() {
@@ -365,9 +394,11 @@ fm_test_run \
   test_required_tool_check_uses_the_adapter_resolver \
   test_create_task_is_independent_labeled_and_refuses_duplicates \
   test_control_interrupt_delivers_the_harness_keys \
+  test_control_exit_accepts_only_proven_stopped_shell \
   test_foreign_or_unlabeled_terminal_gets_no_input_and_no_close \
   test_invalid_session_never_reaches_hc \
   test_inherited_socket_never_overrides_the_session \
+  test_unreadable_process_group_never_proves_stopped \
   test_agent_state_classifies_foreground_and_absence \
   test_agent_state_reads_a_shell_wrappers_group \
   test_kill_proves_the_terminal_is_gone \

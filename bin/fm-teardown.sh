@@ -577,6 +577,10 @@ fi
 fm_lease_guard "$ID" "teardown (fm-teardown)"
 
 META="$STATE/$ID.meta"
+if [ -e "$STATE/$ID.paused" ] || [ -L "$STATE/$ID.paused" ]; then
+  echo "error: task $ID is paused; teardown would discard retained work. Resume and reconcile it first." >&2
+  exit 1
+fi
 TREEHOUSE_PROJECT_LOCK=
 TREEHOUSE_PROJECT_LOCK_HELD=0
 TREEHOUSE_SLOT_LOCK_REQUIRED=0
@@ -1277,6 +1281,14 @@ fi
 # validator rather than probing or closing an ambient current window.
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+if [ -n "$(fm_meta_get "$META" treehouse_lease_id)" ]; then
+  # shellcheck source=bin/fm-task-handoff-lib.sh
+  . "$SCRIPT_DIR/fm-task-handoff-lib.sh"
+  fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || {
+    echo 'error: durable Treehouse lease changed; teardown preserves the copy' >&2
+    exit 1
+  }
+fi
 T_ORCA=
 if [ "$TEARDOWN_WINDOWLESS" = 1 ]; then
   BACKEND=tmux
@@ -2042,11 +2054,16 @@ cleanup_stale_lock_for_safety_check() {
 # stale git index.lock left by a killed crew process. See the script header.
 teardown_treehouse_return() {
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
-  local out lock attempt=0 max_retries lock_desc
+  local out lock attempt=0 max_retries lock_desc holder
+  local -a holder_args=()
+  if [ "$dir" = "${WT:-}" ] && [ -n "${META:-}" ]; then
+    holder=$(fm_meta_get "$META" treehouse_lease_holder)
+    [ -z "$holder" ] || holder_args=(--if-lease-holder "$holder")
+  fi
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$( ( cd "$cd_dir" && treehouse return --force ${holder_args[@]+"${holder_args[@]}"} "$dir" ) 2>&1 ); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
@@ -2071,7 +2088,7 @@ teardown_treehouse_return() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$( ( cd "$cd_dir" && treehouse return --force ${holder_args[@]+"${holder_args[@]}"} "$dir" ) 2>&1 ); then
       [ -n "$out" ] && printf '%s\n' "$out"
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
@@ -2098,7 +2115,7 @@ teardown_treehouse_return() {
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$( ( cd "$cd_dir" && treehouse return --force ${holder_args[@]+"${holder_args[@]}"} "$dir" ) 2>&1 ); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
         return 0
@@ -4209,7 +4226,8 @@ retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 [ ! -e "$CONFIG/fleet-ledger" ] || FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG "$SCRIPT_DIR/fm-fleet-ledger.sh" cleaned_up "$ID" || true
 teardown_retire_status "$STATE" "$ID" || exit 1
 fm_wake_queue_prune_task "$STATE" "$ID" "$T" 2>/dev/null || true
-rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.progress" \
+rm -f "$STATE/$ID.treehouse-lease.json" "$STATE/$ID.claude-native-ready" "$STATE/$ID.native-trust-pending" \
+  "$STATE/$ID.turn-ended" "$STATE/$ID.progress" \
   "$(fm_wake_signal_seen_path "$STATE" "$STATE/$ID.turn-ended")" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.omp-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

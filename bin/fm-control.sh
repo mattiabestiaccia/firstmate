@@ -4,7 +4,8 @@
 #
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
-#        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
+#        fm-control.sh <task-id> pause --note-file <path>
+#        fm-control.sh <task-id> relaunch [--resume-paused] [--harness <name>] [--model <name>]
 #                                         [--effort <level>] [--account <entry>]
 #                                         (--note <text> | --note-file <path>)
 #
@@ -265,6 +266,7 @@ if ! fm_control_verb_allowed "$VERB"; then
   exit 2
 fi
 
+RESUME_PAUSED=0
 NEW_HARNESS=
 NEW_MODEL=
 NEW_EFFORT=
@@ -297,6 +299,7 @@ for control_arg in "$@"; do
     continue
   fi
   case "$control_arg" in
+    --resume-paused) RESUME_PAUSED=1 ;;
     --harness) control_want_value=harness ;;
     --harness=*) NEW_HARNESS=${control_arg#--harness=}; HARNESS_SET=1 ;;
     --model) control_want_value=model ;;
@@ -321,10 +324,15 @@ if [ -n "$control_want_value" ]; then
   die "--$control_want_value requires a value"
 fi
 
-if [ "$VERB" != relaunch ]; then
+if [ "$VERB" != relaunch ] && [ "$VERB" != pause ]; then
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$ACCOUNT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
     || die "--harness, --model, --effort, --account, and --note apply to 'relaunch' only"
 fi
+if [ "$VERB" = pause ]; then
+  [ "$HARNESS_SET$MODEL_SET$EFFORT_SET$ACCOUNT_SET$RESUME_PAUSED" = 00000 ] || die "pause accepts a note only"
+  [ "$NOTE_SET" = 1 ] && [ -n "$NOTE" ] || die "pause requires --note or --note-file"
+fi
+[ "$RESUME_PAUSED" = 0 ] || [ "$VERB" = relaunch ] || die "--resume-paused requires relaunch"
 [ "$ACCOUNT_SET" = 0 ] || [ -n "$NEW_ACCOUNT" ] || die "--account requires a non-empty value"
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
@@ -359,7 +367,13 @@ CONTROL_LOCK_HELD=1
 # only once the lock is held: a process that loses the lock runs the same
 # trap, and would remove the file the lock holder is reading.
 FM_COMPOSER_DIALOG_SINK=$STATE/$ID.composer-dialog
+# shellcheck source=bin/fm-task-handoff-lib.sh
+. "$SCRIPT_DIR/fm-task-handoff-lib.sh"
 META="$STATE/$ID.meta"
+PAUSE_FILE="$STATE/$ID.paused"
+if [ -e "$PAUSE_FILE" ] || [ -L "$PAUSE_FILE" ]; then
+  [ "$VERB" != relaunch ] || [ "$RESUME_PAUSED" = 1 ] || die "task $ID is paused; use relaunch --resume-paused with a progress note"
+fi
 if [ ! -f "$META" ]; then
   case "$RAW_ID" in
     fm-*)
@@ -1224,6 +1238,9 @@ do_relaunch() {
   fm_control_backend_relaunch_supported "$BACKEND" \
     || die "task $ID runs on the $BACKEND backend, where a thread keeps its conversation and a new turn or provider change continues the same agent, so no fresh replacement can be launched into its endpoint; 'interrupt' ends its turn, and a fresh task needs a teardown and a new dispatch"
   resolve_relaunch_profile
+  if [ "$TARGET_HARNESS" = claude ] && [ -f "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/claude-trust-mode" ] && [ "$(cat "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/claude-trust-mode")" = native ]; then
+    [ "$BACKEND" = hc ] && [ "$KIND" != secondmate ] && [ "$(cat "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/claude-permission-mode" 2>/dev/null)" = auto ] || die "native trust requires an hc worker with permission mode auto"
+  fi
 
   case "$KIND" in
     ship|scout)
@@ -1248,6 +1265,16 @@ do_relaunch() {
   else
     note_line="note=none"
   fi
+  if [ "$BACKEND" = hc ]; then
+    fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || die "Treehouse ownership/lease mismatch; handoff refused"
+  fi
+  if [ -e "$PAUSE_FILE" ]; then
+    [ "$(head -n 1 "$PAUSE_FILE")" = paused ] || die "pause is incomplete; confirm stop and finish pause first"
+    python3 "$SCRIPT_DIR/fm-task-checkpoint.py" verify "$WT" "$STATE/$ID.checkpoint.json" || die "paused copy changed; work preserved"
+  fi
+  if [ "$BACKEND" = hc ]; then
+    fm_task_wiring_verify "$META" "$PRIOR_HARNESS" "$WT" "$STATE" "$ID" "$KIND" || die "wiring drift before stopping"
+  fi
   safe_checkpoint
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
@@ -1259,6 +1286,10 @@ do_relaunch() {
   journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
   exit_result=$(do_exit)
   journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  if [ "$BACKEND" = hc ]; then
+    fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || die "slot changed during stop; preserved for review"
+    python3 "$SCRIPT_DIR/fm-task-checkpoint.py" capture "$WT" "$STATE/$ID.checkpoint.json" || die "post-stop checkpoint failed"
+  fi
 
   # The launch owner (fm-spawn --relaunch) clears the previous incarnation's
   # per-task harness wiring before arming the new one, so nothing to do here.
@@ -1268,7 +1299,7 @@ do_relaunch() {
   [ "$TARGET_MODEL" = default ] || spawn_args+=(--model "$TARGET_MODEL")
   [ "$TARGET_EFFORT" = default ] || spawn_args+=(--effort "$TARGET_EFFORT")
   [ -z "$TARGET_ACCOUNT" ] || spawn_args+=(--account "$TARGET_ACCOUNT")
-  if FM_CONTROL_RELAUNCH_TX="$RELAUNCH_TX" \
+  if FM_CONTROL_RESUME_PAUSED="$RESUME_PAUSED" FM_CONTROL_RELAUNCH_TX="$RELAUNCH_TX" \
       "$SCRIPT_DIR/fm-spawn.sh" "${spawn_args[@]}" >/dev/null; then
     RELAUNCH_META_PUBLISHED=1
     # $T was resolved from the record before the launch. When the recorded
@@ -1301,6 +1332,9 @@ do_relaunch() {
 
   journal_write complete "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
   RELAUNCH_ACTIVE=0
+  if [ -e "$PAUSE_FILE" ]; then
+    mv "$PAUSE_FILE" "$STATE/$ID.paused.previous" || die "replacement started but pause record could not be archived"
+  fi
   echo "relaunched $ID harness=$TARGET_HARNESS from=$PRIOR_RECORDED_HARNESS model=$TARGET_MODEL effort=$TARGET_EFFORT backend=$BACKEND endpoint=$T worktree=$WT"
 }
 
@@ -1322,6 +1356,23 @@ case "$VERB" in
     esac
     proof=$(do_interrupt)
     echo "interrupt-delivered $ID harness=$HARNESS backend=$BACKEND verified=$proof"
+    ;;
+  pause)
+    [ "$KIND" != secondmate ] || die "pause currently supports ship/scout tasks only"
+    require_state_verified_backend pause
+    fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || die "Treehouse ownership/lease mismatch; pause refused"
+    if [ -e "$PAUSE_FILE" ]; then
+      [ ! -L "$PAUSE_FILE" ] && [ -f "$PAUSE_FILE" ] || die "unsafe pause record"
+    else
+      (set -o noclobber; printf 'pausing\n%s\n' "$NOTE" > "$PAUSE_FILE") || die "could not reserve pause"
+    fi
+    result=$(do_exit)
+    fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || die "slot changed during stop; copy preserved"
+    python3 "$SCRIPT_DIR/fm-task-checkpoint.py" capture "$WT" "$STATE/$ID.checkpoint.json" || die "checkpoint failed; task remains held"
+    pause_tmp=$(umask 077; mktemp "$STATE/.$ID.paused.XXXXXX") || die "could not stage pause"
+    printf 'paused\n%s\n' "$NOTE" > "$pause_tmp"
+    mv "$pause_tmp" "$PAUSE_FILE" || die "could not finish pause"
+    echo "paused $ID worktree=$WT; lease and files retained"
     ;;
   exit)
     result=$(do_exit)

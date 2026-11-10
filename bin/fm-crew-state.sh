@@ -286,6 +286,16 @@ emit() {  # <state> <source> [detail]
   exit 0
 }
 
+if [ -e "$STATE/$ID.native-trust-pending" ]; then
+  emit blocked task-control "native Claude consent/readiness or brief delivery needs review"
+fi
+if [ -e "$STATE/$ID.paused" ] || [ -L "$STATE/$ID.paused" ]; then
+  if [ ! -L "$STATE/$ID.paused" ] && [ "$(head -n 1 "$STATE/$ID.paused")" = paused ]; then
+    emit paused task-control "copy and Treehouse lease retained"
+  fi
+  emit blocked task-control "pause requested; stopped writer/checkpoint not yet confirmed"
+fi
+
 emit_run() {  # <state> <detail> [pr]
   local detail=$2
   case "$1" in

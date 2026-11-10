@@ -1649,6 +1649,26 @@ Each relaunch installs a fresh worker extension with the home's current list, so
 
 [`bin/fm-exclude-tools-lib.sh`](../bin/fm-exclude-tools-lib.sh) implements parsing and pre-launch validation for this contract; [`bin/fm-spawn.sh`](../bin/fm-spawn.sh)'s header owns the launch-flag mechanics.
 
+## Claude native trust (config/claude-trust-mode)
+
+`config/claude-trust-mode` accepts `legacy` (the existing default) or `native`.
+Native mode is currently scoped to canonical Claude ship/scout launches on hc with `claude-permission-mode=auto`.
+It never invokes the external Claude trust-store helper.
+The operator grants initial folder trust through Claude's own interface for the exact Treehouse copy; workspace trust does not grant external-instruction consent.
+Claude continues to manage its own profile internally.
+No additional profile or copied credentials are required.
+
+The worker launches without its brief prompt.
+A generation-specific SessionStart hook, an alive runtime and the adapter's empty-composer verdict must all agree before the brief is submitted.
+A timeout or unconfirmed submission retains the endpoint, copy and task record with a pending-review marker, blocks ordinary steering and reports the delivery uncertainty.
+No login, trust or Keychain question is answered automatically.
+After operator review, use the recorded task's control relaunch with a progress note; never blindly resend an unconfirmed brief.
+A new copy or revoked trust can require new consent.
+
+This gate has synthetic regression coverage in `tests/fm-control-relaunch.test.sh`.
+Its actual SessionStart ordering and composer behavior require live validation before enabling it in an operational home.
+A distinct profile would be operational separation only, not OS isolation.
+
 ## Worker account pin (config/claude-account, config/pi-account)
 
 A home that mixes accounts for one runner, such as a work login and a personal one, can pin the account its own Claude and Pi workers launch on.

@@ -103,6 +103,15 @@ An input, capture, or close that carries the task label refuses a terminal whose
 | Agent state | `hc get`, the foreground process and its process group, through the shared classifier |
 | Close | `hc kill`, then `hc rm`, then `hc get` must answer not found |
 
+## Treehouse ownership and handoff
+
+New hc workers acquire a durable Treehouse lease with a home-scoped task holder.
+Metadata records the lease id; a separate acquisition receipt remains available if launch fails before task publication.
+A failed launch retains that lease for inspection rather than silently making the copy available.
+A repeated fresh spawn under that id refuses while the receipt remains.
+Use the [task control plane](agent-control.md#pausing-a-treehouse-task) for pause and explicit replacement in the same existing terminal.
+A missing terminal is not yet recoverable through hc relaunch.
+
 ## Limits
 
 - `hc send` always presses Enter, so hc cannot type without submitting.
@@ -112,6 +121,7 @@ An input, capture, or close that carries the task label refuses a terminal whose
   A blocked terminal (exit 9) returns `unknown` without typing or retrying and is never forced.
 - hc reports one foreground process per terminal.
   When that process is a launcher, the adapter also reads the rest of its process group from `ps`, which works only for terminals on the local machine.
+  Failed process inspection returns unreadable and cannot prove the old agent stopped.
 - Right after a terminal starts, `hc get` can report no foreground process yet, and agent state reads `unreadable` until the shell is up.
 - `--secondmate` spawns are refused.
 - A worker inherits `HC_SESSION`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, and `HC_SCOPE` from its terminal, and the `config/launch-env-allowlist` floor keeps them; whether a real harness then reports native status under Firstmate's launch is not verified.

@@ -450,7 +450,7 @@ fm_backend_hc_kill() {  # <target> [unused] [expected-label]
 # host the agent again, exactly like a closed tmux window. A live terminal is
 # classified from hc's foreground process through the shared classifier.
 fm_backend_hc_agent_state() {  # <target>
-  local json rc fields state name argv0 args pid class
+  local json rc fields state name argv0 args pid class group_rc
   fm_backend_hc_parse_target "${1:-}" || { printf 'unreadable'; return 0; }
   json=$(fm_backend_hc_get "$1")
   rc=$?
@@ -477,24 +477,37 @@ EOF
   # of the same foreground process group, which is what tmux reads too. A shell
   # wrapper waiting on the harness is such a launcher, so a shell is only dead
   # once its group holds no harness.
-  fm_backend_hc_group_has_agent "$pid" && { printf 'alive'; return 0; }
+  group_rc=0
+  fm_backend_hc_group_has_agent "$pid" || group_rc=$?
+  case "$group_rc" in
+    0) printf 'alive'; return 0 ;;
+    1) ;;
+    *) printf 'unreadable'; return 0 ;;
+  esac
   [ "$class" != shell ] || { printf 'dead'; return 0; }
   printf 'ambiguous'
 }
 
-# fm_backend_hc_group_has_agent: whether any other process in <pid>'s process
-# group classifies as a harness. Positive evidence only.
+# fm_backend_hc_group_has_agent: 0 = an agent, 1 = inspected and absent,
+# 2 = inspection failed. Unknown must never license another writer.
 fm_backend_hc_group_has_agent() {  # <pid>
-  local pid=$1 pgid member mpgid comm args
-  case "$pid" in ''|*[!0123456789]*) return 1 ;; esac
-  pgid=$(LC_ALL=C ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
-  [ -n "$pgid" ] || return 1
+  local pid=$1 pgid member mpgid comm args rows seen=0 unknown=0
+  case "$pid" in ''|*[!0123456789]*) return 2 ;; esac
+  pgid=$(LC_ALL=C ps -o pgid= -p "$pid" 2>/dev/null) || return 2
+  pgid=${pgid//[[:space:]]/}
+  case "$pgid" in ''|*[!0123456789]*) return 2 ;; esac
+  rows=$(LC_ALL=C ps -A -o pid=,pgid=,comm= 2>/dev/null) || return 2
   while read -r member mpgid comm; do
-    [ "$mpgid" = "$pgid" ] && [ "$member" != "$pid" ] || continue
-    args=$(LC_ALL=C ps -o args= -p "$member" 2>/dev/null) || continue
+    [ "$mpgid" = "$pgid" ] || continue
+    if [ "$member" = "$pid" ]; then seen=1; continue; fi
+    if ! args=$(LC_ALL=C ps -o args= -p "$member" 2>/dev/null); then
+      unknown=1
+      continue
+    fi
     [ "$(fm_agent_process_classify "$comm" "${args%% *}" "$args" "$member")" = agent ] && return 0
   done <<EOF
-$(LC_ALL=C ps -A -o pid=,pgid=,comm= 2>/dev/null)
+$rows
 EOF
+  [ "$seen" = 1 ] && [ "$unknown" = 0 ] || return 2
   return 1
 }

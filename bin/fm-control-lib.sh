@@ -49,13 +49,14 @@ fm_control_verbs() {
   cat <<'EOF'
 interrupt
 exit
+pause
 relaunch
 EOF
 }
 
 fm_control_verb_allowed() {  # <verb>
   case "${1-}" in
-    interrupt|exit|relaunch) return 0 ;;
+    interrupt|exit|pause|relaunch) return 0 ;;
   esac
   return 1
 }
@@ -363,7 +364,7 @@ fm_control_backend_supports_key() {  # <backend> <key>
 # unprovable transition as success.
 fm_control_backend_state_verified() {  # <backend>
   case "${1-}" in
-    tmux|herdr|rex|t3code) return 0 ;;
+    tmux|herdr|rex|t3code|hc) return 0 ;;
   esac
   return 1
 }
@@ -391,7 +392,7 @@ fm_control_backend_exit_supported() {  # <backend>
 # fm_control_backend_state_verified first.
 fm_control_backend_relaunch_supported() {  # <backend>
   case "${1-}" in
-    tmux|herdr|rex) return 0 ;;
+    tmux|herdr|rex|hc) return 0 ;;
   esac
   return 1
 }

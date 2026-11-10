@@ -507,6 +507,14 @@ shift
 if [ -n "$TARGET_META" ]; then
   LEASE_GUARD_TASK=$(fm_send_id_from_meta "$TARGET_META")
   if [ -n "$LEASE_GUARD_TASK" ]; then
+    if [ -e "$STATE/$LEASE_GUARD_TASK.native-trust-pending" ]; then
+      echo "error: native Claude launch pending review; steering refused" >&2
+      exit 1
+    fi
+    if [ -e "$STATE/$LEASE_GUARD_TASK.paused" ] || [ -L "$STATE/$LEASE_GUARD_TASK.paused" ]; then
+      echo "error: task $LEASE_GUARD_TASK is paused; steering refused" >&2
+      exit 1
+    fi
     fm_lease_guard "$LEASE_GUARD_TASK" "steer (fm-send)"
     trap 'fm_lease_guard_release' EXIT
   fi

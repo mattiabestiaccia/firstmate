@@ -841,6 +841,12 @@ fi
 if ! CLAUDE_PERM_PRESENT=$(fm_config_source_present "$CONFIG/claude-permission-mode"); then
   exit 1
 fi
+CLAUDE_TRUST_MODE=legacy
+if [ -e "$CONFIG/claude-trust-mode" ] || [ -L "$CONFIG/claude-trust-mode" ]; then
+  [ -f "$CONFIG/claude-trust-mode" ] && [ -r "$CONFIG/claude-trust-mode" ] || exit 1
+  CLAUDE_TRUST_MODE=$(cat "$CONFIG/claude-trust-mode")
+  case "$CLAUDE_TRUST_MODE" in legacy|native) ;; *) echo 'error: claude-trust-mode must be legacy or native' >&2; exit 1 ;; esac
+fi
 CLAUDE_PERMISSION_MODE=bypass
 if [ "$CLAUDE_PERM_PRESENT" = 1 ]; then
   if [ ! -f "$CONFIG/claude-permission-mode" ] || [ ! -r "$CONFIG/claude-permission-mode" ]; then
@@ -1776,6 +1782,9 @@ spawn_orca_reclaim_launch_file() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ "$status" != 0 ] && [ -n "${TASK_LEASE_ID:-}" ]; then
+    echo "warning: Treehouse lease for $ID at ${WT:-unknown} is retained; inspect the task metadata or $STATE/$ID.treehouse-lease.json before retrying" >&2
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -2003,7 +2012,7 @@ spawn_abort_cleanup() {
   # atomic replacement rather than racing it. A polytoken spawn instead retakes
   # that lock once for a later failure whose record was rolled back. The
   # release itself never removes another task's claim.
-  if [ "$SPAWN_SLOT_CLAIMED" = 1 ] && [ -n "${WT:-}" ] &&
+  if [ "$SPAWN_SLOT_CLAIMED" = 1 ] && [ -z "${TASK_LEASE_ID:-}" ] && [ -n "${WT:-}" ] &&
     [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ] &&
     fm_treehouse_pool_slot "$PROJ_ABS" "$WT"; then
     SPAWN_SLOT_CLAIMED=0
@@ -2442,6 +2451,20 @@ if [ "$RELAUNCH" -eq 0 ]; then
     fi
   fi
 fi
+# shellcheck source=bin/fm-task-handoff-lib.sh
+. "$SCRIPT_DIR/fm-task-handoff-lib.sh"
+if [ -e "$STATE/$ID.paused" ] || [ -L "$STATE/$ID.paused" ]; then
+  [ "$RELAUNCH" = 1 ] && [ "${FM_CONTROL_RESUME_PAUSED:-0}" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ] || {
+    echo "error: task $ID is paused; only explicit control relaunch --resume-paused may continue it" >&2
+    exit 1
+  }
+fi
+if [ "$RELAUNCH" != 1 ] && { [ -e "$STATE/$ID.treehouse-lease.json" ] || [ -L "$STATE/$ID.treehouse-lease.json" ]; }; then
+  echo "error: task $ID has a retained Treehouse acquisition; reconcile its receipt before a new spawn" >&2
+  exit 1
+fi
+TASK_LEASE_HOLDER=
+TASK_LEASE_ID=
 SPAWN_TASK_LOCK="$STATE/.spawn-$ID.lock"
 if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
   echo "error: another spawn is already creating task $ID" >&2
@@ -2558,6 +2581,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
       exit 1
       ;;
   esac
+  if [ "$BACKEND" = hc ]; then
+    fm_task_handoff_verify "$RELAUNCH_META" "$ID" "$FM_HOME" || {
+      echo "error: Treehouse lease/ownership changed; refusing to reuse recorded copy" >&2
+      exit 1
+    }
+    TASK_LEASE_HOLDER=$(fm_meta_get "$RELAUNCH_META" treehouse_lease_holder)
+    TASK_LEASE_ID=$(fm_meta_get "$RELAUNCH_META" treehouse_lease_id)
+  fi
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
@@ -2650,6 +2681,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
     HERDR_WORKSPACE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_workspace_id)
     HERDR_TAB_ID=$(fm_meta_get "$RELAUNCH_META" herdr_tab_id)
     HERDR_PANE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_pane_id)
+  fi
+  if [ "$BACKEND" = hc ]; then
+    HC_SES=$(fm_meta_get "$RELAUNCH_META" hc_session)
+    HC_TERMINAL=$(fm_meta_get "$RELAUNCH_META" hc_terminal)
   fi
   if [ "$BACKEND" = rex ]; then
     FM_REX_TASK_SESSION_ID=$(fm_meta_get "$RELAUNCH_META" rex_session_id)
@@ -6081,7 +6116,7 @@ elif [ "$RELAUNCH" -eq 1 ]; then
     sleep 0.5
   done
   if [ -z "$relaunch_seen" ] || [ "$(real_path_or_raw "$relaunch_seen")" != "$relaunch_wt_real" ]; then
-    if [ "$BACKEND" != herdr ] && [ "$BACKEND" != rex ]; then
+    if [ "$BACKEND" != herdr ] && [ "$BACKEND" != rex ] && [ "$BACKEND" != hc ]; then
       echo "error: task $ID's endpoint is in '${relaunch_seen:-unknown}', not its recorded worktree '$WT'; refusing to relaunch an agent outside the copy holding its work" >&2
       exit 1
     fi
@@ -6105,6 +6140,15 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # A t3code slot was leased and validated in its target branch above.
   if [ "$BACKEND" = t3code ]; then
     :
+  elif [ "$BACKEND" = hc ]; then
+    TASK_LEASE_HOLDER=$(fm_task_lease_holder "$FM_HOME" "$ID") || exit 1
+    hc_slot=$(cd "$PROJ_ABS" && treehouse get --lease --lease-holder "$TASK_LEASE_HOLDER" --json) || exit 1
+    WT=$(printf '%s' "$hc_slot" | jq -er '.path') || exit 1
+    TASK_LEASE_ID=$(printf '%s' "$hc_slot" | jq -er '.lease_id') || exit 1
+    hc_receipt=$(umask 077; mktemp "$STATE/.$ID.treehouse-lease.XXXXXX") || exit 1
+    printf '%s' "$hc_slot" | jq '{path, lease_id, lease_holder, leased_at}' > "$hc_receipt" || exit 1
+    mv "$hc_receipt" "$STATE/$ID.treehouse-lease.json" || exit 1
+    validate_spawn_worktree "treehouse get --lease" "$WT (retained lease; inspect on failure)"
   elif [ "$BACKEND" = herdr ]; then
     spawn_lease_herdr_slot
   else
@@ -6231,12 +6275,17 @@ spawn_assert_agent_worktree
 AGY_TRUST_PREREGISTERED=0
 case "$HARNESS" in
 claude*)
-  if [ "$KIND" = secondmate ]; then
+  if [ "$CLAUDE_TRUST_MODE" = native ]; then
+    [ "$BACKEND" = hc ] && [ "$KIND" != secondmate ] && [ "$RAW_LAUNCH" = 0 ] && [ "$CLAUDE_PERMISSION_MODE" = auto ] || {
+      echo 'error: native trust currently requires a Claude ship/scout on hc with permission mode auto and a canonical launch' >&2
+      exit 1
+    }
+  elif [ "$KIND" = secondmate ]; then
     spawn_trust_args=(--secondmate-home "$PROJ_ABS" "$ID")
   else
     spawn_trust_args=("$WT" "$PROJ_ABS")
   fi
-  if ! "$FM_ROOT/bin/fm-claude-trust.sh" "${spawn_trust_args[@]}" >/dev/null; then
+  if [ "$CLAUDE_TRUST_MODE" != native ] && ! "$FM_ROOT/bin/fm-claude-trust.sh" "${spawn_trust_args[@]}" >/dev/null; then
     echo "error: could not pre-register Claude workspace trust for $WT; refusing to launch a claude worker that would wedge on the trust dialog; $(spawn_endpoint_hint)" >&2
     exit 1
   fi
@@ -6395,6 +6444,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # files and turn-end token registry entries behind, and even a same-harness
   # relaunch would orphan the retired busy generation's token
   # (bin/fm-control-lib.sh owns where those artifacts live).
+  if [ "$BACKEND" = hc ]; then
+    prior_family=$(fm_control_harness_family "$RELAUNCH_PRIOR_HARNESS") || exit 1
+    fm_task_wiring_verify "$RELAUNCH_META" "$prior_family" "$WT" "$STATE_REAL" "$ID" "$KIND" || exit 1
+  fi
   clear_relaunch_harness_wiring "$RELAUNCH_PRIOR_HARNESS" "$WT" "$STATE_REAL" "$ID" "$KIND" || {
     echo "error: could not retire $RELAUNCH_PRIOR_HARNESS wiring for task $ID; refusing to arm the replacement" >&2
     exit 1
@@ -6577,7 +6630,12 @@ BUSY_GEN=
       j_stop=$(json_escape "${stop_turnend}$busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
       stop_entry="\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stop\"}]}],"
     fi
-    hooks_json="\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}]}"
+    native_start=
+    if [ "$CLAUDE_TRUST_MODE" = native ]; then
+      j_ready=$(json_escape "printf '%s\\n' $(shell_quote "$BUSY_GEN") > $(shell_quote "$STATE_REAL/$ID.claude-native-ready")")
+      native_start="\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_ready\"}]}],"
+    fi
+    hooks_json="\"hooks\":{${native_start}\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}]}"
     if [ "$KIND" = secondmate ]; then
       session_keys='"feedbackDrafts":"off",'
       if [ "$KEEP_AI_TRAILERS" != 1 ]; then
@@ -6585,6 +6643,10 @@ BUSY_GEN=
       fi
       printf '{%s%s}\n' "$session_keys" "$hooks_json" >"$STATE_REAL/$ID.claude-settings.json"
     else
+      if [ -e "$WT/.claude/settings.local.json" ] || [ -L "$WT/.claude/settings.local.json" ]; then
+        echo 'error: refusing to overwrite pre-existing worker Claude settings' >&2
+        exit 1
+      fi
       mkdir -p "$WT/.claude"
       printf '{%s}\n' "$hooks_json" >"$WT/.claude/settings.local.json"
       exclude_path '.claude/settings.local.json'
@@ -7326,7 +7388,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx treehouse_lease_holder treehouse_lease_id handoff_wiring_hash polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7336,8 +7398,14 @@ preserve_relaunch_meta() {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
+  if [ -n "$TASK_LEASE_HOLDER" ]; then
+    echo "treehouse_lease_holder=$TASK_LEASE_HOLDER"
+    echo "treehouse_lease_id=$TASK_LEASE_ID"
+  fi
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
+  handoff_wiring_hash=$(fm_task_wiring_hash "$HARNESS" "$WT" "$STATE_REAL" "$ID" "$KIND") || exit 1
+  [ -z "$handoff_wiring_hash" ] || echo "handoff_wiring_hash=$handoff_wiring_hash"
   if [ "$RAW_LAUNCH" = 0 ]; then
     case "$HARNESS" in
       claude) echo "approval_mode=$CLAUDE_PERMISSION_MODE" ;;
@@ -7669,7 +7737,12 @@ case "$LAUNCH" in
     echo "error: could not publish the launch brief for $ID as an operational-inbox record under $brief_opstate; $HARNESS strips the typed operational marker, so the worker was not launched" >&2
     exit 1
   }
-  LAUNCH=${LAUNCH//__BRIEFDOORBELL__/"$(shell_quote "$brief_doorbell")"}
+  if [ "$HARNESS" = claude ] && [ "$CLAUDE_TRUST_MODE" = native ]; then
+    CLAUDE_NATIVE_DOORBELL=$brief_doorbell
+    LAUNCH=${LAUNCH//__BRIEFDOORBELL__/}
+  else
+    LAUNCH=${LAUNCH//__BRIEFDOORBELL__/"$(shell_quote "$brief_doorbell")"}
+  fi
   ;;
 esac
 case "$LAUNCH" in
@@ -8107,6 +8180,39 @@ else
     spawn_orca_wait_launch_consumed
     trap - HUP INT TERM
   fi
+fi
+if [ "$HARNESS" = claude ] && [ "$CLAUDE_TRUST_MODE" = native ]; then
+  # SessionStart generation plus the adapter's empty composer and alive agent
+  # are necessary together. No prompt or consent is answered by this gate.
+  native_ready=0
+  native_polls=${FM_CLAUDE_READY_POLLS:-60}
+  case "$native_polls" in ''|*[!0-9]*) exit 1 ;; esac
+  for ((native_poll=0; native_poll<native_polls; native_poll++)); do
+    if [ -f "$STATE_REAL/$ID.claude-native-ready" ] && [ ! -L "$STATE_REAL/$ID.claude-native-ready" ] &&
+      [ "$(cat "$STATE_REAL/$ID.claude-native-ready")" = "$BUSY_GEN" ] &&
+      [ "$(fm_backend_agent_state "$BACKEND" "$T")" = alive ] &&
+      [ "$(fm_backend_composer_state "$BACKEND" "$T" "$W")" = empty ]; then
+      native_ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$native_ready" = 1 ]; then
+    native_delivery=$(fm_backend_send_text_submit "$BACKEND" "$T" "$CLAUDE_NATIVE_DOORBELL" 1 0.4 0 "$W") || native_delivery=unknown
+  else
+    native_delivery=not-sent
+  fi
+  if [ "$native_ready" != 1 ] || [ "$native_delivery" != empty ]; then
+    printf '%s\n' "$native_delivery" > "$STATE/$ID.native-trust-pending"
+    printf '%s\n' "$(status_stamp_line 'needs-decision: native Claude readiness or brief delivery unconfirmed; inspect consent/login, never auto-answer')" >> "$STATE/$ID.status"
+    # Retain the endpoint, copy and durable record for the operator, even when
+    # backlog acknowledgement fails. Never retry an unconfirmed brief blindly.
+    SPAWN_FRESH_COMMIT_PENDING=0
+    spawn_commit_backlog_transition || echo 'error: pending native launch backlog reconciliation required' >&2
+    echo "error: native Claude launch pending operator review at $T; copy and record retained; brief=$native_delivery" >&2
+    exit 1
+  fi
+  rm -f "$STATE/$ID.native-trust-pending"
 fi
 if [ "$HARNESS" = hermes ] && [ "$RAW_LAUNCH" -eq 0 ]; then
   HERMES_READY=0
