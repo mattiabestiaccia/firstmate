@@ -978,6 +978,14 @@ fm_backlog_close_marker_validate() {  # <marker-path> <authorized-data-dir> <exp
     FM_BACKLOG_TRANSITION_ERROR="foreign data directory in pending-close record $marker"
     return 1
   fi
+  # Optional trailing close-only control, persisted verbatim for replay.
+  # Legacy markers without it retain their historical pruning behavior.
+  local no_prune=0 arg_count=${#args[@]}
+  if [ "$arg_count" -gt 0 ] && [ "${args[$((arg_count - 1))]}" = --no-prune ]; then
+    [ "$mode" = close ] || { FM_BACKLOG_TRANSITION_ERROR="no-prune requires close mode"; return 1; }
+    no_prune=1
+    args=("${args[@]:0:$((arg_count - 1))}")
+  fi
   case "${#args[@]}" in
     0) ;;
     2)
@@ -1050,6 +1058,7 @@ fm_backlog_close_marker_validate() {  # <marker-path> <authorized-data-dir> <exp
       ;;
     *) FM_BACKLOG_TRANSITION_ERROR="invalid pending-close arguments in $marker"; return 1 ;;
   esac
+  [ "$no_prune" = 0 ] || args+=(--no-prune)
   FM_BACKLOG_CLOSE_VALIDATED_ID=$id
   FM_BACKLOG_CLOSE_VALIDATED_DATA=$data_resolved
   FM_BACKLOG_CLOSE_VALIDATED_SPAWN_GEN=$marker_spawn_gen

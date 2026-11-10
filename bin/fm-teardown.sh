@@ -209,7 +209,12 @@
 # leased home releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
-# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record]
+# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record] [--skip-orphan-sweep] [--no-prune]
+#   --no-prune keeps other Done rows in place; persisted in close/replay.
+#     Retained captain-held rows do not run done and need no prune control.
+#   --skip-orphan-sweep excludes only the account-wide orphan remote-job sweep.
+#     Task guards, owned-process cleanup, worktree return and backlog retirement
+#     are unchanged. Without this flag the historical sweep remains enabled.
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks and closes the scout as discarded with no report recorded, and
 #   discards secondmate child work for kind=secondmate. Only use it when the
@@ -543,11 +548,15 @@ ID=$1
 TEARDOWN_LOST_SLOT_EXIT=4
 FORCE=
 LEGACY_RECORD_GIVEN=0
+SKIP_ORPHAN_SWEEP=0
+TEARDOWN_NO_PRUNE=0
 shift
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force) FORCE=--force ;;
     --legacy-record) LEGACY_RECORD_GIVEN=1 ;;
+    --skip-orphan-sweep) SKIP_ORPHAN_SWEEP=1 ;;
+    --no-prune) TEARDOWN_NO_PRUNE=1 ;;
     *)
       echo "error: invalid teardown request" >&2
       exit 2
@@ -1889,6 +1898,9 @@ backlog_done_args() {
       fi
       ;;
   esac
+  if [ "$TEARDOWN_NO_PRUNE" = 1 ] && [ "$BACKLOG_TRANSITION" = close ]; then
+    BACKLOG_DONE_ARGS+=(--no-prune)
+  fi
 }
 
 # Closing the backlog item is this script's own last act on the record, not a
@@ -4067,7 +4079,9 @@ fi
 
 # Fix 3 (see script header): sweep remote job workers abandoned by an already
 # pruned code root. Best effort - a sweep failure never blocks this teardown.
-"$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
+if [ "$SKIP_ORPHAN_SWEEP" -eq 0 ]; then
+  "$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
+fi
 
 # A t3code thread is stopped and archived BEFORE its slot goes back to the pool
 # or, for a secondmate, before its home is removed: a live thread whose
