@@ -5,7 +5,9 @@
 fm_task_preserve_guard() { # <config-directory> <task-id> <operation>
   local config=$1 id=$2 operation=$3 root
   root="$config/task-preservation"
-  if [ -L "$config" ] || { [ -e "$config" ] && { [ ! -d "$config" ] || [ ! -x "$config" ] || [ ! -r "$config" ]; }; }; then
+  # A home may link its config directory: a link that resolves to a usable
+  # directory is read through. A dangling link proves nothing and fails closed.
+  if { [ -L "$config" ] && [ ! -e "$config" ]; } || { [ -e "$config" ] && { [ ! -d "$config" ] || [ ! -x "$config" ] || [ ! -r "$config" ]; }; }; then
     echo "error: task preservation configuration is unsafe or unreadable; refusing $operation" >&2
     return 1
   fi

@@ -3755,8 +3755,9 @@ The shared staleness proof lives in `bin/fm-lock-lib.sh`, which both `fm-teardow
 separate from a captain hold (which retains backlog decisions, not resources).
 With a flag present, `fm-teardown.sh` refuses even `--force`, `fm-control.sh`
 refuses `exit` and `relaunch`, and `fm-spawn.sh` refuses reuse/replacement of the
-ID, including an ID with no metadata. A dangling flag symlink also refuses;
-unsafe/unreadable configuration directories fail closed. Flag content is an
+ID, including an ID with no metadata. A dangling flag symlink also refuses. A
+`config` link that resolves to a readable directory is read through it; a
+dangling link or an unsafe/unreadable configuration directory fails closed. Flag content is an
 operator explanation, never executed. There is no automatic expiry or command
 option that bypasses retention.
 

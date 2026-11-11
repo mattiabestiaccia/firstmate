@@ -48,5 +48,15 @@ with tempfile.TemporaryDirectory(prefix='fm-preserve-test-') as tmp:
  directory=flag.parent;directory.rmdir();directory.symlink_to(home/'missing')
  assert guard().returncode!=0
  print('PASS malformed and dangling-symlink fail closed')
+ # A linked config directory is read through; a dangling one fails closed.
+ directory.unlink();directory.mkdir()
+ target=home/'config-target';(home/'config').rename(target);(home/'config').symlink_to(target)
+ assert guard().returncode==0
+ (target/'task-preservation/task').write_text('Explicit preservation requested for fixture')
+ r=guard();assert r.returncode!=0 and 'resource-preserved' in r.stderr,(r.stdout,r.stderr)
+ (target/'task-preservation/task').unlink()
+ (home/'config').unlink();(home/'config').symlink_to(home/'missing')
+ r=guard();assert r.returncode!=0 and 'unsafe or unreadable' in r.stderr,(r.stdout,r.stderr)
+ print('PASS linked config is read through and a dangling config link fails closed')
  assert not log.exists()
 PY
