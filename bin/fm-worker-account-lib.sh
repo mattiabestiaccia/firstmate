@@ -310,6 +310,12 @@ fm_worker_account_check() {
       verdict="no model listed for provider $provider"
       ;;
     esac
+    case "$verdict" in
+    invalid\ *)
+      echo "error: $setting pins Pi workers to $declared; authentication preflight for provider '$provider' is indeterminate ($verdict). Check runtime configuration and access in the launch context; login is not established as necessary" >&2
+      return 1
+      ;;
+    esac
     echo "error: $setting pins Pi workers to $declared, which is not signed in for provider '$provider' ($verdict); sign in with PI_CODING_AGENT_DIR=$root $harness, then /login, or change the pin" >&2
     return 1
     ;;

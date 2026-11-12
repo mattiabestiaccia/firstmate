@@ -869,7 +869,10 @@ do_exit() {
     if [ -s "$FM_COMPOSER_DIALOG_SINK" ]; then
       refuse_blocking_prompt "$(cat "$FM_COMPOSER_DIALOG_SINK")"
     fi
-    die "exit-delivered $ID interrupt=$interrupt_result exit-command=delivered agent-state=$state exit=unconfirmed; the agent did not stop within ${EXIT_WAIT}s"
+    if [ "$state" = alive ]; then
+      die "exit-delivered $ID interrupt=$interrupt_result exit-command=delivered agent-state=$state exit=unconfirmed; the agent did not stop within ${EXIT_WAIT}s (last observation: alive)"
+    fi
+    die "exit-delivered $ID interrupt=$interrupt_result exit-command=delivered agent-state=$state exit=unconfirmed; stop could not be verified within ${EXIT_WAIT}s; observation failure is not evidence that the agent is still running"
   }
   # The incarnation is over: retire its busy wiring so no stale record or
   # orphaned generation survives the agent that produced it.
