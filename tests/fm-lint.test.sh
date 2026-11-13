@@ -551,6 +551,25 @@ test_main_branch_forces_full_lint() {
   pass "fm-lint.sh forces a full lint when HEAD is on main"
 }
 
+test_comma_decimal_locale_keeps_root_timing_working() {
+  local tmp fakebin log out loc
+  # Any installed locale whose decimal separator is a comma proves the case.
+  for loc in it_IT.UTF-8 de_DE.UTF-8 fr_FR.UTF-8 de_AT.UTF-8 de_CH; do
+    case "$(LC_ALL=$loc bash -c 'printf %s "$EPOCHREALTIME"' 2>/dev/null)" in *,*) break ;; esac
+    loc=''
+  done
+  [ -n "$loc" ] || { pass "comma-decimal locale check skipped: no comma locale installed"; return 0; }
+  tmp=$(fm_test_tmproot fm-lint-comma-locale)
+  fakebin=$(fm_fakebin "$tmp")
+  log="$tmp/shellcheck.log"
+  fm_lint_stub_shellcheck "$fakebin" "$log"
+  out=$(PATH="$fakebin:$PATH" LC_ALL="$loc" FM_LINT_JOBS=1 \
+    "$LINT" bin/fm-install-shellcheck.sh 2>&1) \
+    || fail "lint failed under comma-decimal locale $loc"$'\n'"$out"
+  case "$out" in *"valore troppo grande"*|*"value too great"*) fail "locale $loc broke timing arithmetic"$'\n'"$out" ;; esac
+  pass "fm-lint.sh timing survives a comma-decimal locale ($loc)"
+}
+
 test_explicit_path_bypasses_changed_logic() {
   local tmp fakebin log out target
   tmp=$(fm_test_tmproot fm-lint-explicit-override)
@@ -2065,6 +2084,7 @@ test_changed_mode_lints_only_the_changed_file
 test_ci_forces_full_lint_even_with_empty_diff
 test_main_branch_forces_full_lint
 test_explicit_path_bypasses_changed_logic
+test_comma_decimal_locale_keeps_root_timing_working
 test_zero_changed_files_exits_clean
 test_list_files_respects_changed_mode
 test_changed_mode_drops_external_sources_and_excludes_cross_file_codes
