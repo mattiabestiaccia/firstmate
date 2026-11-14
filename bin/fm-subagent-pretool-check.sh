@@ -44,6 +44,10 @@
 #   INERT - not a genuine primary home (a crewmate/scout task worktree or a
 #           non-firstmate repo): exit 0 with no output, exactly like ALLOW.
 #   ESCAPE - FM_ALLOW_SUBAGENT=1 in the environment allows deliberately.
+#   MESSAGING ALLOW - a closed-list messaging or observation tool named in the
+#          optional per-home config/subagent-allow-tools file (one exact
+#          lowercase tool name per line) is allowed; see
+#          docs/subagent-guard.md "Per-home messaging allowlist".
 #   FAIL OPEN - malformed or empty stdin, or missing jq for stdin transport.
 #
 # Claude requires stdout to remain empty on deny.
@@ -77,6 +81,13 @@ OBSERVE_ONLY_TOOLS='taskoutput taskstop taskget tasklist cronlist bashoutput kil
 # contract untrue. Both lists are exact-name, never substring, so neither can
 # widen by accident.
 PLAN_ONLY_TOOLS='taskcreate taskupdate'
+
+# Closed list of exact lowercase tool names a home may release through its
+# optional config/subagent-allow-tools file. These only message or observe
+# peer sessions and create no fleet work. Any other name in that file is
+# ignored with a warning, so the file can never open Agent, Task, Workflow,
+# Cron*, or any other work-creating tool. The list lives in code on purpose.
+HOME_ALLOWABLE_TOOLS='sendmessage listagents'
 
 TOOL=""
 TOOL_SET=0
@@ -180,6 +191,29 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && 
 FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)} || exit 0
 FM_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}
 STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+CONFIG=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}
+
+# Per-home messaging allowlist. The file is optional: absent, unreadable, or
+# empty means behavior identical to having no file. Matching is exact on the
+# lowercase, whitespace-trimmed line, never by substring, and only names in
+# HOME_ALLOWABLE_TOOLS are honored.
+ALLOW_FILE="$CONFIG/subagent-allow-tools"
+if [ -f "$ALLOW_FILE" ] && [ -r "$ALLOW_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    entry=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [ -n "$entry" ] || continue
+    case "$entry" in '#'*) continue ;; esac
+    permitted=0
+    for ok in $HOME_ALLOWABLE_TOOLS; do
+      [ "$entry" != "$ok" ] || permitted=1
+    done
+    if [ "$permitted" -eq 1 ]; then
+      [ "$NORMALIZED" != "$entry" ] || exit 0
+    else
+      echo "fm-subagent-pretool-check: ignoring '$entry' in $ALLOW_FILE: not in the closed list of messaging tools ($HOME_ALLOWABLE_TOOLS)" >&2
+    fi
+  done < "$ALLOW_FILE"
+fi
 
 # Scope to a genuine primary home, exactly as the session-start nudge and the
 # turn-end guard do. fm_primary_scope_matches accepts a plain checkout or a

@@ -148,6 +148,19 @@ A local Claude deny list is upstream of hook scope and removes known Claude dele
 Do not put that list in tracked project settings, because linked worktrees inherit those settings and would lose legitimate delegation tools.
 The hook scope is the shipped enforcement boundary, and the linked-worktree negative case proves the script itself does not block legitimate crewmate delegation.
 
+## Per-home messaging allowlist
+
+An optional local, gitignored `config/subagent-allow-tools` file releases message-only tools for one home.
+List exact tool names, one per line; matching is exact on the lowercased, whitespace-trimmed line, never by substring, and blank lines and lines starting with `#` are skipped.
+An absent or empty file leaves behavior identical to having none.
+Only names in the closed list in the guard script (`sendmessage` and `listagents`) are honored.
+Any other name, such as `agent`, `task`, `workflow`, or `cronCreate`, is ignored with a warning on stderr, so the file can never open a tool that creates work.
+
+The reason is that `SendMessage` to a peer session creates no fleet work, and the primary session cannot start subagents, so it has none to resume.
+Without the exception the stem match on `sendmessage` and `agent` stops a primary from answering direct messages from other sessions in its own home.
+This is separate from `FM_ALLOW_SUBAGENT`, which stays the only escape hatch for work-creating tools, and it does not touch `.claude/settings.json` or a local Claude deny list.
+[`config/subagent-allow-tools`](configuration.md#primary-delegation-guard-allowlist-configsubagent-allow-tools) owns the home-level summary.
+
 ## Escape hatch
 
 `FM_ALLOW_SUBAGENT=1` in the session environment allows the call at the shipped hook.

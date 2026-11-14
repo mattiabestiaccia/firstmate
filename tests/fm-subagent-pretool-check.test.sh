@@ -276,6 +276,37 @@ test_missing_jq_stdin_transport_fails_open() {
   pass "missing jq for stdin transport fails open rather than denying every tool call"
 }
 
+test_home_allowlist_releases_only_messaging_tools() {
+  local cfg="$TMP_ROOT/allow-config" rc
+  mkdir -p "$cfg"
+  expect_deny "no allowlist file" SendMessage
+  expect_deny "no allowlist file" ListAgents
+
+  : > "$cfg/subagent-allow-tools"
+  expect_deny "empty allowlist file" SendMessage
+
+  printf 'sendmessage\n' > "$cfg/subagent-allow-tools"
+  expect_allow "sendmessage listed" SendMessage FM_CONFIG_OVERRIDE="$cfg"
+  rc=0; run_tool ListAgents FM_CONFIG_OVERRIDE="$cfg" || rc=$?
+  [ "$rc" -eq 2 ] || fail "unlisted ListAgents must stay denied, got $rc"
+  rc=0; run_tool SendMessageX FM_CONFIG_OVERRIDE="$cfg" || rc=$?
+  [ "$rc" -eq 2 ] || fail "substring variant of a listed name must stay denied, got $rc"
+
+  printf '  SendMessage  \n# comment\n\nLISTAGENTS\n' > "$cfg/subagent-allow-tools"
+  expect_allow "case and spaces" SendMessage FM_CONFIG_OVERRIDE="$cfg"
+  expect_allow "case and spaces" ListAgents FM_CONFIG_OVERRIDE="$cfg"
+
+  local tool
+  for tool in Agent Workflow Task CronCreate; do
+    printf '%s\nsendmessage\n' "$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')" > "$cfg/subagent-allow-tools"
+    rc=0; run_tool "$tool" FM_CONFIG_OVERRIDE="$cfg" || rc=$?
+    [ "$rc" -eq 2 ] || fail "$tool listed in the allowlist must stay denied, got $rc"
+    grep -q "ignoring '$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')'" "$ERR" \
+      || fail "$tool in the allowlist produced no warning: $(cat "$ERR")"
+  done
+  pass "config/subagent-allow-tools releases only closed-list messaging tools, exact name, with warnings for the rest"
+}
+
 test_guard_denies_every_currently_known_delegation_tool
 test_guard_denies_hypothetical_future_tools
 test_guard_allows_ordinary_and_observe_only_tools
@@ -289,3 +320,4 @@ test_secondmate_home_is_in_scope
 test_stdin_transports_and_output_shapes
 test_malformed_transport_fails_open
 test_missing_jq_stdin_transport_fails_open
+test_home_allowlist_releases_only_messaging_tools

@@ -88,6 +88,14 @@ These signals never become maintainer verdicts or merge authority.
 A bot signal's text is third-party content for the owning home to triage, never instructions to follow.
 [`fm-contributions.sh --help`](../bin/fm-contributions.sh) owns the exact allowlist format and polling contract.
 
+## Primary delegation guard allowlist (config/subagent-allow-tools)
+
+The optional local, gitignored `config/subagent-allow-tools` file lets one home release message-only tools that the primary-session delegation guard would otherwise deny by name shape.
+List exact tool names, one per line, compared in lowercase and never by substring.
+Only `sendmessage` and `listagents` are accepted; any other name is ignored with a warning on stderr.
+A home with no file, or an empty one, behaves exactly as without the feature, and secondmate homes do not inherit it.
+[`docs/subagent-guard.md`](subagent-guard.md#per-home-messaging-allowlist) owns the contract and the reason.
+
 ## Operational home layout and state
 
 This section is the single owner of the top-level operational-home layout.
