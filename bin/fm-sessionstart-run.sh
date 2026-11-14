@@ -28,11 +28,15 @@
 #   clear, compact          `--reemit` digest only when this lock owner recorded
 #                           a completed full startup; otherwise a full digest,
 #                           so a startup killed mid-sweep is finished first
-#   resume, reload, fork    delegate to the nudge wrapper. Prior context is
-#                           restored on these, so re-running is redundant when
-#                           this process still holds the lock (the nudge stays
-#                           silent) and a plain instruction is enough when a new
-#                           process resumed an old session (the nudge fires).
+#   resume, reload, fork    silent when the lock holder is this process or a
+#                           near ancestor (fm_session_lock_in_ancestry, the
+#                           nudge wrapper's own check), because prior context
+#                           is restored; otherwise a full digest, because a new
+#                           process resumed an old session and has not taken the
+#                           helm. The hook runs it rather than nudging: an agent
+#                           command can be unable to see its harness in its own
+#                           ancestry (a sandbox that hides other processes), so
+#                           only the hook can take the lock for it.
 #
 # Every ordinary transport path exits 0, exactly like the nudge wrapper: a
 # Claude SessionStart exit 2 blocks session initialization, so a failed session
@@ -139,7 +143,9 @@ fi
 
 case "$SOURCE" in
   resume|reload|fork)
-    exec "$SCRIPT_DIR/fm-sessionstart-nudge.sh"
+    if ! fm_session_lock_in_ancestry "$STATE"; then
+      "$SCRIPT_DIR/fm-session-start.sh" --source "$SOURCE" || true
+    fi
     ;;
   clear|compact)
     if session_start_completed; then

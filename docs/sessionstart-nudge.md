@@ -27,7 +27,7 @@ The tier is a property of the harness surface, not of the home.
 | Tier | What the adapter does | Used by |
 | --- | --- | --- |
 | Run | Executes `bin/fm-session-start.sh` through the native session-open adapter and gates its ordered digest into model context before the first turn. | Claude, `codex exec`, verified native Codex TUI, Pi / pi-signed, omp, Cursor, Antigravity (agy) |
-| Nudge | Asks the agent to run the digest through the native adapter or the tracked session-start instruction. | Grok, OpenCode, and run-tier sources routed to the nudge |
+| Nudge | Asks the agent to run the digest through the native adapter or the tracked session-start instruction. | Grok, OpenCode |
 
 Codex's interactive TUI has verified session-open delivery only on the native version selected by `bin/fm-codex-stop-park.sh`; its compaction and re-emit surfaces remain unverified.
 
@@ -70,7 +70,7 @@ A re-emit (`--reemit`) reprints the digest for a process that already has the he
 | --- | --- | --- |
 | `startup`, `new` | Full digest | This is a true session start that has not taken the helm; Pi CLI continuations are refined to `resume` by the adapter before reaching this boundary. |
 | `clear`, `compact` | `--reemit` after a proven complete startup, otherwise full digest | This process normally has the helm and lost only its context, but an earlier hook may have been truncated after acquiring the lock. |
-| `resume`, `reload`, `fork` | Delegate to the nudge wrapper | Prior context is restored, so re-running is redundant when the lock is still ours and an instruction is enough when a new process resumed an old session. |
+| `resume`, `reload`, `fork` | Nothing when the lock holder is this process or a near ancestor, otherwise full digest | Prior context is restored, so re-running is redundant when the lock is still ours; a new process that resumed an old session has not taken the helm, so the adapter takes it. |
 | unreadable or unrecognized | Full digest | Taking the helm redundantly is cheap and idempotent; not taking it is the bug this tier exists to fix. |
 
 ### Change from the previous nudge matcher
@@ -78,7 +78,9 @@ A re-emit (`--reemit`) reprints the digest for a process that already has the he
 This routing deliberately inverts the previous nudge matcher, which fired on `startup|resume|clear` and excluded `compact`.
 
 - Compaction is covered where a tracked adapter delivers that source, because a compacted session has lost exactly the digest it needs.
-- Resume is excluded from the run because it restores that digest instead of losing it.
+- Resume re-runs nothing in the process that already took the helm, because it restores that digest instead of losing it.
+- Resume in a new process runs the full digest from the adapter rather than asking the agent to run it.
+  An agent command can be unable to see its own harness process in its ancestry, for example under a sandbox that hides processes it did not start, and then every agent-run session start stays read-only; the adapter process can see that ancestry.
 
 ### Lock and completion interlock
 
@@ -103,13 +105,12 @@ So `clear` or `compact` cannot skip startup sweeps after a truncated run.
 So a proven `clear` or `compact` re-emit re-verifies ownership and proceeds.
 A lock another live session took meanwhile still produces the ordinary read-only digest.
 
-### Nudge wrapper on a run-tier harness
+### Context-preserving sources on a run-tier harness
 
-On a run-tier harness, only `resume`, `reload`, and `fork` are routed to the nudge wrapper.
-The nudge wrapper has its own separate ancestry-only check, which normally stays silent when this process already holds the lock.
+For `resume`, `reload`, and `fork`, the run wrapper uses the same ancestry check as the nudge wrapper, described in [Nudge wrapper lock check](#nudge-wrapper-lock-check), and stays silent when it holds.
 A background Claude helper-chain recycle can break that ancestry.
-The wrapper may then emit a redundant nudge even though the shared same-session verdict still owns the lock.
-The requested session start remains idempotent.
+The wrapper may then run a redundant full digest even though the shared same-session verdict still owns the lock.
+That session start remains idempotent, because `bin/fm-lock.sh` treats the same-session lock as its own.
 
 ### Re-emit mechanics
 
@@ -205,7 +206,7 @@ The Ahoy skill's own step 0 helm check is the fallback that protects a nudge-tie
 ### Nudge wrapper lock check
 
 Before printing, the nudge wrapper reads `state/.lock` and walks at most eight parents from its own pid.
-It does this in its own separate, hard-coded loop, independent of two other ownership checks:
+It does this through `fm_session_lock_in_ancestry` in `bin/fm-session-lock-lib.sh`, which the run wrapper's context-preserving sources share, and which is independent of two other ownership checks:
 
 - The shared sixteen-hop ancestry walk in `bin/fm-session-lock-lib.sh` that `bin/fm-lock.sh` uses for anchor selection and ownership.
 - Pi's `lockOwnership()`.
@@ -413,7 +414,7 @@ It proves a fresh primary whose state directory cannot be created reports that o
 It proves the run wrapper's source routing end to end against a real `fm-session-start.sh`, including:
 
 - Completion-gated `--reemit` selection.
-- Resume delegation.
+- Context-preserving resume: silence when the lock holder is an ancestor, and the full digest with the lock acquired when it is not.
 - Pi CLI continuation classification.
 - An unrecognized source falling through to the full digest.
 - Bounded loud delivery of an oversized Pi digest.

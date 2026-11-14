@@ -885,6 +885,37 @@ fm_session_lock_owned_by_self() {
   fm_harness_pid_alive "$lock_pid"
 }
 
+# True when state dir $1 holds a lock whose recorded pid is live and is this
+# process or one of its first eight parents, with no harness-name test. This is
+# the session-open "already ran here" check that bin/fm-sessionstart-nudge.sh
+# and bin/fm-sessionstart-run.sh's context-preserving sources share: a hook
+# fired inside the session that took the helm stays silent. It is deliberately
+# narrower than fm_session_lock_owned_by_self and never decides ownership for
+# acquisition. A Windows-tagged holder is outside this process table, so it
+# defers to fm_session_lock_owned_by_self, which owns that boundary.
+fm_session_lock_in_ancestry() {  # <state>
+  local state=$1 lock_pid pid=$$ _
+  [ -f "$state/.lock" ] || return 1
+  IFS= read -r lock_pid < "$state/.lock" 2>/dev/null || return 1
+  if fm_win_untag_pid "$lock_pid" >/dev/null; then
+    fm_session_lock_owned_by_self "$state"
+    return
+  fi
+  case "$lock_pid" in
+    # PID 1 can own the session inside a PID namespace; compare it below.
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$lock_pid" 2>/dev/null || return 1
+  for _ in 1 2 3 4 5 6 7 8; do
+    [ "$pid" = "$lock_pid" ] && return 0
+    pid=$(fm_ps_ppid "$pid")
+    # Compare the top of the chain before stopping, as in the walk above.
+    case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$pid" -ge 1 ] || return 1
+  done
+  return 1
+}
+
 # True when state dir $1 records a lock owner outside this process's contiguous
 # harness ancestry that this session must not reclaim and did not record under
 # its own trusted Claude session id - a live verified harness, or a live owner

@@ -967,14 +967,37 @@ JS
   pass "Pi retains a bounded digest prefix and loudly marks oversized preflight delivery"
 }
 
-test_run_resume_delegates_to_the_nudge() {
-  local root="$TMP_ROOT/run-resume" out status=0
-  make_run_primary "$root"
-  out=$(run_hook "$root" --source resume </dev/null) || status=$?
-  expect_code 0 "$status" "run wrapper resume"
-  [ "$out" = "$NUDGE_LINE" ] || fail "resume did not delegate to the exact nudge line, got: $out"
-  assert_absent "$root/state/.lock" "resume acquired the fleet lock instead of delegating"
-  pass "run wrapper: resume delegates to the nudge instead of re-running the digest"
+test_run_context_preserving_sources_take_the_helm_without_a_lock() {
+  local root out source status
+  for source in resume reload fork; do
+    root="$TMP_ROOT/run-$source"
+    make_run_primary "$root"
+    status=0
+    out=$(run_hook "$root" --source "$source" </dev/null) || status=$?
+    expect_code 0 "$status" "run wrapper $source without a lock"
+    assert_contains "$out" "$FULL_BANNER$root" "$source without a held lock did not run the full digest"
+    assert_contains "$out" "lock acquired: harness pid" "$source without a held lock did not take the fleet lock"
+    assert_not_contains "$out" "$REEMIT_BANNER" "$source was misrouted to a context re-emit"
+    assert_not_contains "$out" "FIRSTMATE_OP" "$source asked the agent to run the session start instead of running it"
+    assert_present "$root/state/.lock" "$source left no fleet lock behind"
+  done
+  pass "run wrapper: resume, reload, and fork without a held lock run the full digest and take the lock"
+}
+
+test_run_context_preserving_sources_are_silent_with_an_owned_lock() {
+  local root out source status
+  for source in resume reload fork; do
+    root="$TMP_ROOT/run-owned-$source"
+    make_run_primary "$root"
+    out=$(run_hook "$root" --source startup </dev/null)
+    assert_contains "$out" "lock acquired: harness pid" \
+      "the $source fixture did not take the lock first, so its silence would prove nothing"
+    status=0
+    out=$(run_hook "$root" --source "$source" </dev/null) || status=$?
+    expect_code 0 "$status" "run wrapper $source with an owned lock"
+    [ -z "$out" ] || fail "$source with a lock held by this session was not silent: $out"
+  done
+  pass "run wrapper: resume, reload, and fork stay silent when this session already holds the lock"
 }
 
 test_run_reads_source_from_the_hook_payload() {
@@ -987,14 +1010,15 @@ test_run_reads_source_from_the_hook_payload() {
   assert_contains "$out" "$REEMIT_BANNER$root" "a compact hook payload was not routed to a re-emit"
 
   # A fresh root, because the compact case above legitimately took the lock and
-  # an owned lock is exactly when the nudge is supposed to stay silent.
+  # an owned lock is exactly when a resume is supposed to stay silent.
   root="$TMP_ROOT/run-payload-resume"
   make_run_primary "$root"
   status=0
   out=$(printf '{"source":"resume","cwd":"/nowhere"}' | run_hook "$root") || status=$?
   expect_code 0 "$status" "run wrapper payload resume"
-  assert_contains "$out" "FIRSTMATE_OP" "a resume hook payload did not delegate to the nudge"
-  assert_not_contains "$out" "SESSION START" "a resume hook payload still ran the digest"
+  assert_contains "$out" "$FULL_BANNER$root" "a resume hook payload without a lock did not run the full digest"
+  assert_not_contains "$out" "$REEMIT_BANNER" "a resume hook payload was misrouted to a context re-emit"
+  assert_not_contains "$out" "FIRSTMATE_OP" "a resume hook payload asked the agent instead of running"
   pass "run wrapper: the hook payload's source field drives routing with no explicit argument"
 }
 
@@ -1109,7 +1133,8 @@ test_run_rebuild_forwards_source_to_drifted_instruction_refresh
 test_run_compact_without_completion_refreshes_before_finishing_startup
 test_run_clear_without_completion_finishes_startup
 test_run_clear_rejects_previous_owner_completion
-test_run_resume_delegates_to_the_nudge
+test_run_context_preserving_sources_take_the_helm_without_a_lock
+test_run_context_preserving_sources_are_silent_with_an_owned_lock
 test_run_reads_source_from_the_hook_payload
 test_run_unknown_source_takes_the_helm
 test_run_gate_and_scope_are_silent

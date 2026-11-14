@@ -452,8 +452,8 @@ function sessionstartMessage(
   }
   if (!raw) return undefined;
   try {
-    // The wrapper already returns an encoded nudge on a context-preserving
-    // open, so only an unencoded digest or fallback needs the marker added.
+    // Output that is already encoded operational input keeps its marker, so
+    // only an unencoded digest or fallback needs the marker added.
     const content = classifyFirstmateCurrentOperationalText(raw)
       ? raw
       : encodeFirstmateOperationalInput("session-start", raw);
