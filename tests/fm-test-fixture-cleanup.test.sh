@@ -16,6 +16,38 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LIB="$ROOT/tests/lib.sh"
+PROCINFO="$ROOT/tests/fm-test-procinfo.py"
+
+# An identity of this run's own family that differs from the live owner's, as
+# left by a dead owner whose PID this process reused.
+reused_identity() {
+  case "$(fm_test_identity_family "$FM_TEST_OWNER_IDENTITY")" in
+    legacy-ps) printf '%s\n' 'Thu Jan  1 00:00:00 1970 reused-process' ;;
+    *) printf '%s=0 reused-process\n' "${FM_TEST_OWNER_IDENTITY%%=*}" ;;
+  esac
+}
+
+# A pid that has exited and been reaped.
+gone_pid() {
+  local pid
+  sleep 0 &
+  pid=$!
+  wait "$pid" 2>/dev/null || true
+  printf '%s\n' "$pid"
+}
+
+# A PATH directory whose ps cannot execute, as under a Seatbelt sandbox. With
+# --no-reader its python3 cannot answer either, so no ps-free reader remains.
+blind_process_bin() {
+  local bin=$1
+  mkdir -p "$bin"
+  printf '#!/bin/sh\necho "ps: Operation not permitted" >&2\nexit 126\n' > "$bin/ps"
+  chmod +x "$bin/ps"
+  if [ "${2:-}" = --no-reader ]; then
+    printf '#!/bin/sh\nexit 2\n' > "$bin/python3"
+    chmod +x "$bin/python3"
+  fi
+}
 
 test_fixture_root_gone_after_normal_exit() {
   local child_out child_dir
@@ -120,7 +152,7 @@ test_orphan_sweep_respects_fixture_ownership() {
   touch -t 202001010000 "$active_dir/.fm-test-fixture"
 
   stale_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-stale.XXXXXX")
-  printf '%s\n%s\n' "$$" reused-process-identity > "$stale_dir/.fm-test-fixture"
+  printf '%s\n%s\n' "$$" "$(reused_identity)" > "$stale_dir/.fm-test-fixture"
   touch -t 202001010000 "$stale_dir/.fm-test-fixture"
   fresh_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-fresh.XXXXXX")
   : > "$fresh_dir/.fm-test-fixture"
@@ -149,7 +181,7 @@ test_orphan_sweep_reaps_read_only_package_tree() {
   stale_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-read-only.XXXXXX")
   package_dir="$stale_dir/packages/extension"
   mkdir -p "$package_dir"
-  printf '%s\n%s\n' "$$" reused-process-identity > "$stale_dir/.fm-test-fixture"
+  printf '%s\n%s\n' "$$" "$(reused_identity)" > "$stale_dir/.fm-test-fixture"
   printf 'installed package\n' > "$package_dir/entrypoint.py"
   chmod -R a-w "$stale_dir/packages"
   touch -t 202001010000 "$stale_dir/.fm-test-fixture"
@@ -243,6 +275,118 @@ test_registries_avoid_git_worktree_root() {
   pass "test registries and fixture roots stay out of a git worktree TMPDIR"
 }
 
+# A marker in a format this run cannot compare - the ps-based identity older
+# libraries wrote, or an unrecognised one - must never let age reap the root of
+# a live concurrent run, while a proven-gone owner still lets age decide.
+test_orphan_sweep_keeps_live_owner_of_uncomparable_marker() {
+  local legacy_dir unknown_dir gone_dir dead
+  legacy_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-legacy.XXXXXX")
+  printf '%s\n%s\n' "$$" 'Wed Nov 18 10:00:00 2026 /bin/bash ./tests/some.test.sh' > "$legacy_dir/.fm-test-fixture"
+  unknown_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-unknown.XXXXXX")
+  printf '%s\n%s\n' "$$" unrecognised-identity-format > "$unknown_dir/.fm-test-fixture"
+  dead=$(gone_pid)
+  gone_dir=$(mktemp -d "$FM_TEST_TMPDIR/fm-test-cleanup-gone.XXXXXX")
+  printf '%s\n%s\n' "$dead" 'Wed Nov 18 10:00:00 2026 /bin/bash ./tests/some.test.sh' > "$gone_dir/.fm-test-fixture"
+  touch -t 202001010000 "$legacy_dir/.fm-test-fixture" "$unknown_dir/.fm-test-fixture" "$gone_dir/.fm-test-fixture"
+
+  bash -c '
+    # shellcheck source=tests/lib.sh
+    . "$1"
+  ' _ "$LIB"
+
+  if [ "$(fm_test_identity_family "$FM_TEST_OWNER_IDENTITY")" != legacy-ps ]; then
+    assert_present "$legacy_dir" \
+      "the orphan reaper removed a live owner's root whose marker holds the older ps identity format"
+  fi
+  assert_present "$unknown_dir" \
+    "the orphan reaper removed a live owner's root whose marker identity format is unrecognised"
+  assert_absent "$gone_dir" \
+    "the orphan reaper kept an old root whose owner is proven gone"
+  rm -rf "$legacy_dir" "$unknown_dir"
+  pass "the orphan sweep never ages out a live owner it cannot compare"
+}
+
+test_procinfo_reads_own_processes_without_argv_or_environment() {
+  if [ "$(uname -s)" != Darwin ]; then
+    pass "the libproc reader answers for own processes # SKIP macOS-only reader"
+    return
+  fi
+  local child identity ppid state dead rc
+  FM_PROCINFO_PROBE_SECRET=fm-env-marker bash -c 'sleep 30' fm-argv-marker &
+  child=$!
+  sleep 0.2
+  identity=$(python3 -I "$PROCINFO" identity "$child") || fail "the reader could not identify its own child"
+  case "$identity" in
+    darwin-start=[0-9]*.[0-9][0-9][0-9][0-9][0-9][0-9]' comm='?*) : ;;
+    *) fail "the reader printed an identity outside its documented form: $identity" ;;
+  esac
+  assert_not_contains "$identity" fm-argv-marker "the identity carries the process's argv"
+  assert_not_contains "$identity" fm-env-marker "the identity carries the process's environment"
+  ppid=$(python3 -I "$PROCINFO" ppid "$child") || fail "the reader could not read its own child's parent"
+  assert_equals "$$" "$ppid" "the reader reported the wrong parent pid"
+  state=$(python3 -I "$PROCINFO" state "$child") || fail "the reader could not read its own child's state"
+  case "$state" in
+    [RS]) : ;;
+    *) fail "the reader reported a sleeping child in state '$state'" ;;
+  esac
+  kill "$child" 2>/dev/null
+  wait "$child" 2>/dev/null || true
+  dead=$(gone_pid)
+  rc=0
+  python3 -I "$PROCINFO" state "$dead" >/dev/null 2>&1 || rc=$?
+  expect_code 1 "$rc" "a reaped pid must read as no such process"
+  rc=0
+  python3 -I "$PROCINFO" identity 1 >/dev/null 2>&1 || rc=$?
+  expect_code 2 "$rc" "another uid's process must read as not observable"
+  pass "the libproc reader answers for own processes without argv or environment"
+}
+
+test_crash_injector_requires_observable_death() {
+  local harness fakebin blind child rc out
+  harness=$(fm_test_tmproot fm-test-crash-inject)
+  fakebin="$harness/fakebin"
+  mkdir -p "$fakebin"
+  fm_fake_crash_injector "$fakebin"
+
+  sleep 30 &
+  child=$!
+  rc=0
+  "$fakebin/fm-crash-inject" "$child" || rc=$?
+  expect_code 0 "$rc" "the crash injector failed to confirm a killed child"
+  wait "$child" 2>/dev/null || true
+
+  blind="$harness/blind"
+  blind_process_bin "$blind" --no-reader
+  sleep 30 &
+  child=$!
+  rc=0
+  out=$(PATH="$blind:$PATH" "$fakebin/fm-crash-inject" "$child" 2>&1) || rc=$?
+  wait "$child" 2>/dev/null || true
+  expect_code 1 "$rc" "the crash injector claimed a death it could not observe"
+  assert_contains "$out" "cannot observe pid $child" "the crash injector did not name the unobservable target"
+  pass "the crash injector confirms death only from an observable state"
+}
+
+test_root_sweep_reports_unobservable_process_table() {
+  local harness blind out rc
+  harness=$(fm_test_tmproot fm-test-cleanup-blind)
+  blind="$harness/blind"
+  blind_process_bin "$blind"
+  rc=0
+  out=$(PATH="$blind:$PATH" bash -c '
+    # shellcheck source=tests/lib.sh
+    . "$1"
+    rc=0
+    fm_test_reap_root_processes "$2" || rc=$?
+    printf "sweep-rc=%s\n" "$rc"
+  ' _ "$LIB" "$harness/root" 2>&1) || rc=$?
+  expect_code 0 "$rc" "a suite whose ps cannot run failed to start or clean up"
+  assert_contains "$out" "sweep-rc=2" "the root sweep claimed an unobservable process table was clean"
+  assert_contains "$out" "process table not observable (ps exited 126)" \
+    "the root sweep did not report the unobservable process table"
+  pass "the root sweep reports an unobservable process table instead of a clean one"
+}
+
 test_fixture_root_gone_after_normal_exit
 test_fixture_root_gone_after_sigterm
 test_cleanup_registry_resists_precreation
@@ -251,3 +395,7 @@ test_orphan_sweep_respects_fixture_ownership
 test_orphan_sweep_reaps_read_only_package_tree
 test_registries_avoid_git_worktree_root
 test_cleanup_reaps_orphaned_poller_naming_its_root
+test_orphan_sweep_keeps_live_owner_of_uncomparable_marker
+test_procinfo_reads_own_processes_without_argv_or_environment
+test_crash_injector_requires_observable_death
+test_root_sweep_reports_unobservable_process_table

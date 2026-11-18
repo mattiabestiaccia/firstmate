@@ -256,7 +256,74 @@ fm_test_pid_identity() {
     '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid"
 }
 
-FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
+# Process facts the test library itself needs come from libproc first on
+# macOS, because /bin/ps is setuid and cannot execute inside a Seatbelt
+# sandbox. tests/fm-test-procinfo.py owns the reader and its exit codes:
+# 0 printed, 1 no such process, anything else not observable. Off macOS it is
+# not observable, so ps and /proc keep answering there unchanged.
+# fm_test_pid_identity above stays the production fm_pid_identity, because
+# suites write it into records that production code compares.
+FM_TEST_PROCINFO="$ROOT/tests/fm-test-procinfo.py"
+_FM_TEST_UNAME=$(uname -s 2>/dev/null || echo unknown)
+
+fm_test_procinfo() {  # <ppid|state|identity> <pid>
+  [ "$_FM_TEST_UNAME" = Darwin ] || return 2
+  python3 -I "$FM_TEST_PROCINFO" "$1" "$2" 2>/dev/null
+}
+
+# Succeeds only when <pid> is proven gone, never when it is merely unreadable.
+fm_test_pid_gone() {  # <pid>
+  local rc=0 err
+  fm_test_procinfo state "$1" >/dev/null || rc=$?
+  case "$rc" in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  err=$(LC_ALL=C /bin/kill -0 "$1" 2>&1) && return 1
+  case "$err" in
+    *"No such process"*) return 0 ;;
+  esac
+  return 1
+}
+
+fm_test_proc_ppid() {  # <pid>
+  local rc=0
+  fm_test_procinfo ppid "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  ps -o ppid= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# The fixture-ownership identity of <pid>: libproc's start time and process
+# name on macOS, else fm_pid_identity. Returns 1 when <pid> is proven gone and
+# 2 when it is alive or unknown but its identity cannot be read.
+fm_test_fixture_owner_identity() {  # <pid>
+  local rc=0
+  fm_test_procinfo identity "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  fm_test_pid_identity "$1" 2>/dev/null && return 0
+  fm_test_pid_gone "$1" && return 1
+  return 2
+}
+
+# The format family of a recorded fixture-owner identity: the leading key of a
+# keyed form, legacy-ps for fm_pid_identity's lstart-first macOS form, and
+# unknown for anything else. Identities compare only within one known family.
+fm_test_identity_family() {  # <identity>
+  case "$1" in
+    darwin-start=* | linux-starttime=* | proc-starttime=*) printf '%s\n' "${1%%=*}" ;;
+    [[:upper:]][[:lower:]][[:lower:]]' '[[:upper:]][[:lower:]][[:lower:]]' '[[:blank:][:digit:]][[:digit:]]' '[[:digit:]][[:digit:]]:[[:digit:]][[:digit:]]:[[:digit:]][[:digit:]]' '[[:digit:]][[:digit:]][[:digit:]][[:digit:]]' '*)
+      printf '%s\n' legacy-ps ;;
+    *) printf '%s\n' unknown ;;
+  esac
+}
+
+FM_TEST_OWNER_IDENTITY=$(fm_test_fixture_owner_identity "$$") || {
   rm -f "$FM_TEST_CLEANUP_REGISTRY"
   return 1
 }
@@ -392,19 +459,33 @@ fm_test_remove_tree() {
 # TERM and then KILL, each followed by a bounded 2s wait. The match is the
 # unique per-run root path, never a script or process name, so it cannot reach
 # another home's processes; this shell and its ancestors are never signalled.
+# Matching needs every process's command line, which only ps provides without
+# also reading environments. When ps cannot run, the sweep reports the process
+# table as not observable on stderr and returns 2 instead of claiming that
+# nothing names the root; callers still remove the root.
+FM_TEST_REAP_UNOBSERVABLE_REPORTED=
 fm_test_reap_root_processes() {  # <root>
-  local root=${1%/} chain pid pids signal i
+  local root=${1%/} chain pid pids signal i table ps_rc
   [ -n "$root" ] && [ "$root" != / ] || return 0
   chain=" "
   pid=$$
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
     chain="$chain$pid "
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    pid=$(fm_test_proc_ppid "$pid")
   done
   for signal in TERM KILL; do
     i=0
     while [ "$i" -lt 20 ]; do
-      pids=$(ps -ww -eo pid=,args= 2>/dev/null \
+      ps_rc=0
+      table=$(ps -ww -eo pid=,args= 2>/dev/null) || ps_rc=$?
+      if [ "$ps_rc" -ne 0 ]; then
+        if [ -z "$FM_TEST_REAP_UNOBSERVABLE_REPORTED" ]; then
+          FM_TEST_REAP_UNOBSERVABLE_REPORTED=1
+          echo "fm_test_reap_root_processes: process table not observable (ps exited $ps_rc); processes naming fixture roots were not checked" >&2
+        fi
+        return 2
+      fi
+      pids=$(printf '%s\n' "$table" \
         | FM_TEST_REAP_ROOT="$root/" awk -v chain="$chain" \
           'index($0, ENVIRON["FM_TEST_REAP_ROOT"]) && index(chain, " " $1 " ") == 0 { print $1 }')
       [ -n "$pids" ] || return 0
@@ -426,7 +507,7 @@ fm_test_cleanup() {
   if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
     while IFS= read -r d; do
       [ -n "$d" ] || continue
-      fm_test_reap_root_processes "$d"
+      fm_test_reap_root_processes "$d" || true
       fm_test_remove_tree "$d"
     done < "$FM_TEST_CLEANUP_REGISTRY"
     rm -f "$FM_TEST_CLEANUP_REGISTRY"
@@ -462,8 +543,14 @@ trap 'fm_test_cleanup; exit 131' QUIT
 # fallback for dead or unowned roots.
 FM_TEST_ORPHAN_MAX_AGE_SECONDS=${FM_TEST_ORPHAN_MAX_AGE_SECONDS:-3600}
 
+#
+# Only a proven-gone owner or a proven PID reuse lets age decide. A marker whose
+# identity this run cannot compare - an older library's format, such as the
+# ps-based identity written before the libproc reader, or an unrecognised one -
+# may belong to a live concurrent run, so it is never stale while its pid is
+# alive; the same holds while the owner's identity cannot be read at all.
 fm_test_reap_orphans() {
-  local marker dir mtime now owner_pid owner_identity current_identity
+  local marker dir mtime now owner_pid owner_identity current_identity rc family
   now=$(date +%s)
   for marker in "$FM_TEST_TMPDIR"/fm-*/.fm-test-fixture; do
     [ -e "$marker" ] || continue
@@ -472,16 +559,24 @@ fm_test_reap_orphans() {
     case "$owner_pid" in
       '' | *[!0-9]*) ;;
       *)
-        current_identity=$(fm_test_pid_identity "$owner_pid" 2>/dev/null) || current_identity=
-        if [ -n "$owner_identity" ] && [ "$current_identity" = "$owner_identity" ]; then
-          continue
+        if [ -n "$owner_identity" ]; then
+          rc=0
+          current_identity=$(fm_test_fixture_owner_identity "$owner_pid") || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            family=$(fm_test_identity_family "$owner_identity")
+            [ "$family" != unknown ] || continue
+            [ "$family" = "$(fm_test_identity_family "$current_identity")" ] || continue
+            [ "$current_identity" != "$owner_identity" ] || continue
+          elif [ "$rc" -ne 1 ]; then
+            continue
+          fi
         fi
         ;;
     esac
     mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || continue
     [ $((now - mtime)) -ge "$FM_TEST_ORPHAN_MAX_AGE_SECONDS" ] || continue
     dir=$(dirname "$marker")
-    fm_test_reap_root_processes "$dir"
+    fm_test_reap_root_processes "$dir" || true
     fm_test_remove_tree "$dir"
   done
 }
@@ -671,11 +766,16 @@ SH
 # injection a wall-clock bet that a loaded host loses: the fake wakes up and
 # completes the very operation the case needs left unfinished. Exits non-zero
 # with a diagnostic if the target outlives the signal, so a broken injection
-# fails loudly rather than silently changing what the case measures.
+# fails loudly rather than silently changing what the case measures. The state
+# comes from the libproc reader first on macOS and from ps otherwise; when
+# neither can observe the target it also exits non-zero, because an unreadable
+# state is not evidence that the process is gone.
 fm_fake_crash_injector() {
   local fakebin=$1
-  cat > "$fakebin/fm-crash-inject" <<'SH'
-#!/usr/bin/env bash
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'FM_TEST_PROCINFO=%q\n' "$FM_TEST_PROCINFO"
+    cat <<'SH'
 set -u
 target=${1:?fm-crash-inject: <pid> required}
 case "$target" in
@@ -684,11 +784,40 @@ case "$target" in
     exit 1
     ;;
 esac
+uname_s=$(uname -s 2>/dev/null || true)
+# Prints the run state; returns 1 when the target is gone, 2 when unobservable.
+target_state() {
+  local rc=0 out
+  if [ "$uname_s" = Darwin ]; then
+    out=$(python3 -I "$FM_TEST_PROCINFO" state "$1" 2>/dev/null) || rc=$?
+    case "$rc" in
+      0) printf '%s\n' "$out"; return 0 ;;
+      1) return 1 ;;
+    esac
+  fi
+  rc=0
+  out=$(ps -o state= -p "$1" 2>/dev/null) || rc=$?
+  out=$(printf '%s' "$out" | tr -d '[:space:]')
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  # ps exits 1 without output when no process matches; 126 or 127 means it
+  # could not run at all.
+  [ "$rc" -eq 1 ] && return 1
+  return 2
+}
 kill -KILL "$target" 2>/dev/null || true
 waited=0
 while [ "$waited" -lt 600 ]; do
-  case "$(ps -o state= -p "$target" 2>/dev/null | tr -d '[:space:]')" in
-    ''|Z*) exit 0 ;;
+  rc=0
+  state=$(target_state "$target") || rc=$?
+  case "$rc:$state" in
+    1:*|0:Z*) exit 0 ;;
+    2:*)
+      echo "fm-crash-inject: cannot observe pid $target after SIGKILL: neither libproc nor ps answered" >&2
+      exit 1
+      ;;
   esac
   waited=$((waited + 1))
   sleep 0.05
@@ -696,6 +825,7 @@ done
 echo "fm-crash-inject: pid $target still running 30s after SIGKILL" >&2
 exit 1
 SH
+  } > "$fakebin/fm-crash-inject"
   chmod +x "$fakebin/fm-crash-inject"
 }
 
