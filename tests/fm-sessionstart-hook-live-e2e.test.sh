@@ -15,6 +15,10 @@
 #       (bin/fm-startup-network.sh), so a harness that reaps the hook's process
 #       tree would silently stop running the sweeps entirely. Whether it does is
 #       a vendor behavior no portable test can see.
+#   (d) on Claude, an interactive resume honors a SessionStart JSON answer: its
+#       initialUserMessage starts a model turn before anyone types, and its
+#       additionalContext reaches that turn. The run wrapper's resume wake
+#       depends on both.
 #
 # docs/sessionstart-nudge.md owns the routing facts (a) and (b) feed, and
 # tests/fm-sessionstart-nudge.test.sh pins that routing portably with real
@@ -163,7 +167,13 @@ printf '%s\n' "$source" >> "$record"
 if [ -n "${FM_LIVE_DETACH_MARKER:-}" ]; then
   "$(dirname "$0")/fm-startup-network.sh" start --locked 0 --harvest-pid $$ >/dev/null 2>&1 || true
 fi
-printf 'FMHOOKTOKEN-%s-%s-%s\n' "$source" "$(grep -c . "$record" | tr -d ' ')" "${FM_LIVE_NONCE:?}"
+token=$(printf 'FMHOOKTOKEN-%s-%s-%s' "$source" "$(grep -c . "$record" | tr -d ' ')" "${FM_LIVE_NONCE:?}")
+if [ "${FM_LIVE_RESUME_WAKE:-0}" = 1 ] && [ "$source" = resume ]; then
+  # The shape bin/fm-sessionstart-run.sh's resume wake prints.
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s","initialUserMessage":"Reply with exactly the FMHOOKTOKEN value from your session-start context immediately followed by -WOKE, and nothing else."}}\n' "$token"
+else
+  printf '%s\n' "$token"
+fi
 exit 0
 SH
   chmod +x "$lab/bin/fm-sessionstart-run.sh"
@@ -321,6 +331,38 @@ probe_context_reset() {  # <harness> <version> <lab> <clear-command> <launch-arg
     note "$harness $version: compaction was NOT reached in this lab (recorded: $(tr '\n' ' ' < "$record")); its compact evidence was not refreshed"
   fi
 
+  tmux -L "$SOCKET" kill-session -t "$session" >/dev/null 2>&1 || true
+}
+
+# --- (d) Claude resume wake -----------------------------------------------------
+#
+# An interactive `claude --continue` in the lab, whose recorder answers the
+# resume with SessionStart JSON. No key is sent beyond a trust prompt, so only
+# the hook's initialUserMessage can start the turn, and only its
+# additionalContext carries the token the reply must quote.
+probe_claude_resume_wake() {  # <version> <lab>
+  local version=$1 lab=$2 session=fmss-claude-wake n
+  local record="$lab/record"
+  : > "$record"
+  tmux -L "$SOCKET" new-session -d -s "$session" -c "$lab" -x 200 -y 50 \
+    -e FM_LIVE_RECORD="$record" -e FM_ROOT_OVERRIDE="$lab" -e FM_HOME="$lab" \
+    -e FM_LIVE_NONCE="$LIVE_NONCE" -e FM_LIVE_RESUME_WAKE=1 \
+    "claude --continue --permission-mode bypassPermissions" \
+    || fail "claude $version: could not start an interactive resume in the lab"
+  n=0
+  while [ "$n" -lt 60 ] && ! grep -q . "$record" 2>/dev/null; do
+    if capture "$session" | grep -qiE 'trust (this|the|parent)?[[:space:]]*(folder|project)'; then
+      tmux -L "$SOCKET" send-keys -t "$session" Enter
+      sleep 5
+    fi
+    sleep 2
+    n=$((n + 1))
+  done
+  [ "$(head -n 1 "$record" 2>/dev/null)" = resume ] \
+    || { capture "$session" >&2; fail "claude $version: an interactive --continue did not report source resume (recorded: $(tr '\n' ' ' < "$record"))"; }
+  wait_for_text "$session" "FMHOOKTOKEN-resume-1-$LIVE_NONCE-WOKE" 90 \
+    || { capture "$session" >&2; fail "claude $version: a SessionStart initialUserMessage did not start a turn on an interactive resume, or its additionalContext did not reach that turn"; }
+  pass "claude $version: an interactive resume runs the SessionStart initialUserMessage as a turn with the hook's additionalContext in context"
   tmux -L "$SOCKET" kill-session -t "$session" >/dev/null 2>&1 || true
 }
 
@@ -604,6 +646,7 @@ for harness in claude codex pi; do
         -- claude --continue -p --permission-mode bypassPermissions
       probe_context_reset claude "$version" "$lab" /clear \
         claude --permission-mode bypassPermissions
+      probe_claude_resume_wake "$version" "$lab"
       ;;
     codex)
       probe_process_opens codex "$version" "$lab" resume \

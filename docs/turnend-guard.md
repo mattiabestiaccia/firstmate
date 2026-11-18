@@ -359,6 +359,7 @@ A healthy hours-long foregrounded cycle keeps the beacon beating.
 An unconfirmed startup follows the [arm backstop and safe-interruption contract](watcher-continuity.md#startup-interruption-window), not an unconditional arming deadline.
 A missing or unusable lock means no session can receive a rewake, so such a claim is never open.
 The reachability test is what makes an open claim deliverable: a hook whose session exited mid-cycle stays alive with no parent to receive its exit 2, so deferring to it would leave the replacement session deaf until a captain turn.
+A resumed replacement gets that first turn from the session-open hook's [resume wake](sessionstart-nudge.md#resume-wake) rather than from the captain.
 The session-id signal is the second one the claiming hook's own admission accepts, so a background session whose bridge is recycled mid-cycle - breaking the ancestry to its still-live lock owner - keeps its live claim instead of being double-armed.
 Pinning that signal to the session-lock identity recorded at claim time is what keeps a resumed session, which carries the same conversation id in a new process, from reading its own dead predecessor's orphan as open - a reused pid number or reissued Windows pid is a different identity, so it does not match.
 An orphan fails both signals: it no longer descends from the replacement's lock pid, and its recorded lock-holder identity is the dead session's.

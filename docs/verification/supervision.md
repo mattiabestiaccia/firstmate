@@ -203,6 +203,26 @@ The Ahoy first-message boundary was reverified on 2026-07-22 with Pi 0.81.1 and 
 Marked current operational input and the two exact legacy compatibility shapes selected Bearings, while genuine near-miss captain messages remained real boundaries.
 The detailed reconciliation and task chronology stay in the private audit report and PR evidence.
 
+### Claude background copies and the resume wake, 2026-11-18
+
+Both refinements in [`sessionstart-nudge.md`](../sessionstart-nudge.md#background-copies) rest on Claude Code 2.1.327 facts observed on macOS.
+The process Claude Code left running after the exit dialog's "Move to background and exit" ran the home's SessionStart hook, took the free lock, and listed as:
+
+```text
+$ ps -p 31992 -o pid,etime,command
+  PID ELAPSED COMMAND
+31992   05:25 claude bg-spare --bg-spare /tmp/cc-daemon-501/cc4b5241/spare/3171170
+```
+
+The SessionStart hook output schema in the same build carries `initialUserMessage` beside `additionalContext`:
+
+```sh
+strings -a ~/.local/share/claude/versions/2.1.327 | grep -o 'hookEventName:C("SessionStart"),additionalContext:r().optional(),initialUserMessage:r().optional()'
+```
+
+That an interactive resume runs `initialUserMessage` as a turn with `additionalContext` in context had not yet been observed live on this date.
+`FM_SESSIONSTART_HOOK_LIVE_E2E=1 tests/fm-sessionstart-hook-live-e2e.test.sh` is the command that proves it, and it spends model turns.
+
 ### Per-task endpoint reads cannot truncate the digest
 
 A per-task backend endpoint liveness read that dies mid-read inside the digest process takes every later stage with it, and a parent wrapper that banners only the runtime-bound exit stays silent about the missing sections.

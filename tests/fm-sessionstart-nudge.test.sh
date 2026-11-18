@@ -1000,6 +1000,172 @@ test_run_context_preserving_sources_are_silent_with_an_owned_lock() {
   pass "run wrapper: resume, reload, and fork stay silent when this session already holds the lock"
 }
 
+# --- Claude-shaped session processes ------------------------------------------
+#
+# A Claude Code process is identified by its argv, so these fixtures are a bash
+# named `claude` whose argv[0] is chosen with `exec -a`. A background copy is
+# argv[0] `claude bg-spare --bg-spare <sock>`, the shape Claude Code's daemon
+# gives a claimed spare, so its dispatch flag sits where Claude Code reads it.
+# session.sh optionally exports the trusted Claude session identity
+# (CLAUDE_CODE_SESSION_ID plus its own pid as CLAUDE_PID) and then runs the
+# command it was given, so one fixture process can host several hook runs the
+# way one real session does.
+CLAUDE_FIXTURE="$TMP_ROOT/claude-fixture"
+mkdir -p "$CLAUDE_FIXTURE"
+ln -s /bin/bash "$CLAUDE_FIXTURE/claude"
+cat > "$CLAUDE_FIXTURE/session.sh" <<'SH'
+if [ -n "${FM_FIXTURE_SESSION_ID:-}" ]; then
+  export CLAUDE_CODE_SESSION_ID="$FM_FIXTURE_SESSION_ID" CLAUDE_PID=$$
+fi
+"$@"
+rc=$?
+exit "$rc"
+SH
+SPARE_ARGV0='claude bg-spare --bg-spare fm-test-claim.sock'
+JQ_DIR=$(dirname "$(command -v jq 2>/dev/null || printf '/nonexistent/jq')")
+
+# Run the run wrapper inside a Claude-shaped process.
+run_hook_as_claude() {  # <argv0> <session-id-or-empty> <root> [wrapper args...]
+  local argv0=$1 session_id=$2 root=$3
+  shift 3
+  # shellcheck disable=SC2093 # The subshell is the fixture process itself.
+  (FM_FIXTURE_SESSION_ID=$session_id exec -a "$argv0" "$CLAUDE_FIXTURE/claude" "$CLAUDE_FIXTURE/session.sh" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" FM_HOME="$root" PATH="$JQ_DIR:$RUN_PATH" "$RUN" "$@")
+}
+
+# Run a startup and then a resume inside ONE Claude-shaped process, printing
+# only the resume's output, so the resume finds the lock this session took.
+run_startup_then_resume_as_claude() {  # <session-id-or-empty> <root>
+  local session_id=$1 root=$2
+  # shellcheck disable=SC2093,SC2016 # The subshell is the fixture process; $1 expands inside it.
+  (FM_FIXTURE_SESSION_ID=$session_id exec -a claude "$CLAUDE_FIXTURE/claude" "$CLAUDE_FIXTURE/session.sh" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" FM_HOME="$root" PATH="$JQ_DIR:$RUN_PATH" \
+    /bin/bash -c '"$1" --source startup </dev/null >/dev/null; "$1" --source resume </dev/null' _ "$RUN")
+}
+
+BACKGROUND_BANNER="SESSION START - BACKGROUND COPY - "
+
+test_run_background_copy_never_takes_a_free_lock() {
+  local root out source status
+  for source in startup resume compact; do
+    root="$TMP_ROOT/run-bg-spare-$source"
+    make_run_primary "$root"
+    status=0
+    out=$(run_hook_as_claude "$SPARE_ARGV0" "" "$root" --source "$source" </dev/null) || status=$?
+    expect_code 0 "$status" "background copy $source"
+    assert_contains "$out" "$BACKGROUND_BANNER$root" "a background copy's $source did not say it is a background copy"
+    assert_contains "$out" "did not take this home's fleet lock" "a background copy's $source did not say the lock stays free"
+    assert_not_contains "$out" "$FULL_BANNER$root" "a background copy's $source still ran the full digest"
+    assert_not_contains "$out" "lock acquired" "a background copy's $source took the fleet lock"
+    assert_absent "$root/state/.lock" "a background copy's $source left a fleet lock behind"
+  done
+
+  # The same Claude-shaped process with the flag outside Claude Code's dispatch
+  # position - where a prompt could carry it - is an ordinary session and takes
+  # the helm, so the stand-down above is the dispatch flag's doing.
+  root="$TMP_ROOT/run-bg-spare-control"
+  make_run_primary "$root"
+  out=$(run_hook_as_claude 'claude -p --bg-spare' "" "$root" --source startup </dev/null)
+  assert_contains "$out" "$FULL_BANNER$root" "an ordinary Claude session with --bg-spare in a prompt did not run the full digest"
+  assert_contains "$out" "lock acquired: harness pid" "an ordinary Claude session with --bg-spare in a prompt did not take the lock"
+  assert_not_contains "$out" "$BACKGROUND_BANNER" "an ordinary Claude session was mistaken for a background copy"
+  pass "run wrapper: a Claude background copy never takes a free fleet lock and says so, while an ordinary session still does"
+}
+
+test_run_background_copy_keeps_a_lock_it_owns() {
+  local root="$TMP_ROOT/run-bg-spare-owned" out status=0
+  make_run_primary "$root"
+  # The copy already holds the lock (its own pid is the recorded owner), as a
+  # session whose model loop moved into a spare does: it keeps the helm.
+  # shellcheck disable=SC2093,SC2016 # The subshell is the fixture process; $1 and $2 expand inside it.
+  out=$(exec -a "$SPARE_ARGV0" "$CLAUDE_FIXTURE/claude" "$CLAUDE_FIXTURE/session.sh" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" FM_HOME="$root" PATH="$RUN_PATH" \
+    /bin/bash -c 'printf "%s\n" "$PPID" > "$2/state/.lock"; "$1" --source compact </dev/null' _ "$RUN" "$root") || status=$?
+  expect_code 0 "$status" "background copy compact with an owned lock"
+  assert_contains "$out" "$FULL_BANNER$root" "a background copy that owns the lock did not finish its startup"
+  assert_contains "$out" "lock acquired: harness pid" "a background copy lost a lock it already owned"
+  assert_not_contains "$out" "$BACKGROUND_BANNER" "a background copy that owns the lock was told to stand down"
+  pass "run wrapper: a background copy that already owns the lock keeps the helm"
+}
+
+# Print field $2 of the SessionStart JSON $1, or fail the case when $1 is not that JSON.
+session_start_json_field() {  # <output> <field>
+  printf '%s' "$1" | jq -er --arg f "$2" '.hookSpecificOutput | select(.hookEventName == "SessionStart") | .[$f] // empty'
+}
+
+assert_resume_wake() {  # <output> <root> <label>
+  local out=$1 root=$2 label=$3 message kind body
+  message=$(session_start_json_field "$out" initialUserMessage) \
+    || fail "$label did not print a SessionStart wake: $out"
+  kind=$(printf '%s' "$message" | FM_STATE_OVERRIDE="$root/state" bash "$ROOT/bin/fm-operational-input.sh" doorbell-kind) \
+    || fail "$label's wake is not a doorbell for a record in this home: $message"
+  [ "$kind" = watcher ] || fail "$label's wake record has kind '$kind', not watcher"
+  body=$(FM_STATE_OVERRIDE="$root/state" bash "$ROOT/bin/fm-operational-input.sh" open \
+    "$(printf '%s' "$message" | sed "s/^.*read '\\(.*\\)' and handle.*$/\\1/")") \
+    || fail "$label's wake record could not be opened"
+  assert_contains "$body" "check: session-resume" "$label's wake record does not name the resume"
+  assert_contains "$body" "bin/fm-wake-drain.sh" "$label's wake record does not ask for a drain"
+}
+
+test_run_resume_wakes_a_claude_session_that_needs_supervision() {
+  local root out context
+  if [ ! -x "$JQ_DIR/jq" ]; then
+    printf '# skip: jq is not installed, so the resume wake (which needs it) is unverified\n'
+    return 0
+  fi
+
+  # A new process resuming the conversation takes the helm and is woken: the
+  # digest becomes the JSON's context and the wake its initial message.
+  root="$TMP_ROOT/run-wake-new-process"
+  make_run_primary "$root"
+  : > "$root/state/t1.meta"
+  out=$(run_hook_as_claude claude S1 "$root" --source resume </dev/null)
+  assert_resume_wake "$out" "$root" "a resumed new process"
+  context=$(session_start_json_field "$out" additionalContext) || fail "a resumed new process lost its digest"
+  assert_contains "$context" "$FULL_BANNER$root" "a resumed new process's wake did not carry the full digest"
+  assert_contains "$context" "lock acquired: harness pid" "a resumed new process's wake did not carry the lock result"
+
+  # A resume inside the process that already holds the lock has no digest to
+  # print, but is woken all the same.
+  root="$TMP_ROOT/run-wake-owned"
+  make_run_primary "$root"
+  : > "$root/state/t1.meta"
+  out=$(run_startup_then_resume_as_claude S1 "$root")
+  assert_resume_wake "$out" "$root" "a resume that already holds the lock"
+  [ -z "$(session_start_json_field "$out" additionalContext)" ] \
+    || fail "a resume that already holds the lock re-printed a digest: $out"
+
+  # Controls, each changing one condition of the cases above, so the wake is
+  # proven to come from that condition: no supervision need, away mode, and no
+  # trusted Claude session id keep today's plain output.
+  root="$TMP_ROOT/run-wake-idle"
+  make_run_primary "$root"
+  out=$(run_startup_then_resume_as_claude S1 "$root")
+  [ -z "$out" ] || fail "an idle home's resume was not silent: $out"
+  root="$TMP_ROOT/run-wake-idle-new"
+  make_run_primary "$root"
+  out=$(run_hook_as_claude claude S1 "$root" --source resume </dev/null)
+  assert_contains "$out" "$FULL_BANNER$root" "an idle home's resumed new process lost its plain digest"
+  assert_not_contains "$out" "initialUserMessage" "an idle home's resume was woken"
+
+  root="$TMP_ROOT/run-wake-afk"
+  make_run_primary "$root"
+  : > "$root/state/t1.meta"
+  : > "$root/state/.afk"
+  out=$(run_startup_then_resume_as_claude S1 "$root")
+  [ -z "$out" ] || fail "a resume in away mode was woken: $out"
+
+  root="$TMP_ROOT/run-wake-untrusted"
+  make_run_primary "$root"
+  : > "$root/state/t1.meta"
+  out=$(run_startup_then_resume_as_claude "" "$root")
+  [ -z "$out" ] || fail "a resume without a trusted Claude session id was woken: $out"
+  pass "run wrapper: a resumed Claude session that needs supervision is woken, and nothing else is"
+}
+
 test_run_reads_source_from_the_hook_payload() {
   local root="$TMP_ROOT/run-payload" out status=0
   make_run_primary "$root"
@@ -1135,6 +1301,9 @@ test_run_clear_without_completion_finishes_startup
 test_run_clear_rejects_previous_owner_completion
 test_run_context_preserving_sources_take_the_helm_without_a_lock
 test_run_context_preserving_sources_are_silent_with_an_owned_lock
+test_run_background_copy_never_takes_a_free_lock
+test_run_background_copy_keeps_a_lock_it_owns
+test_run_resume_wakes_a_claude_session_that_needs_supervision
 test_run_reads_source_from_the_hook_payload
 test_run_unknown_source_takes_the_helm
 test_run_gate_and_scope_are_silent

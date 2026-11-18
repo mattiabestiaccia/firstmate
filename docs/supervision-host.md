@@ -257,6 +257,8 @@ The default retry interval is five minutes, and successful submission still does
 Automatic retries currently reach Claude only through that verified tmux or herdr pane.
 A primary outside both, an unavailable pane, or a blocked composer keeps its watcher and queued work but needs another normal turn or a human message.
 A failed watcher restart or a terminated retry owner is not a guarantee of continued supervision.
+A resumed or restarted Claude session is not reached by this retry either: the owner is pinned to the session-lock holder it started under and stops once a new process takes the lock, and a primary in an hc terminal has neither transport.
+The session-open hook's [resume wake](sessionstart-nudge.md#resume-wake) gives such a session its first turn instead.
 [verification/supervision.md](verification/supervision.md#supervision-host) owns the dated live results and verification entry points for both transports.
 All other primaries and the host-off Stop path retain their existing behavior.
 

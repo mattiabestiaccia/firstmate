@@ -622,6 +622,34 @@ fm_harness_ancestry_pid() {
   _fm_harness_outermost_pid "$pids"
 }
 
+# Print the pid of a Claude Code background spare in this session's contiguous
+# harness ancestry, or return 1. A spare (`claude bg-spare --bg-spare <sock>`)
+# is the process Claude Code's daemon claims to run a conversation in the
+# background, for example after the exit dialog's "Move to background and
+# exit". The flag is read only where Claude Code dispatches on it - the first
+# argument, after an optional `bg-spare` process-title word - never from later
+# argv, where prompts and briefs are visible, and never from any environment.
+# This answers only "is this a background copy"; it decides no ownership.
+fm_harness_ancestry_bg_spare_pid() {
+  local pids pid rest
+  pids=$(fm_harness_ancestry_pids) || return 1
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    fm_proc_info "$pid" || continue
+    rest=${FM_PROC_ARGS#* }
+    [ "$rest" != "$FM_PROC_ARGS" ] || continue
+    case "$rest" in
+      --bg-spare | '--bg-spare '* | 'bg-spare --bg-spare' | 'bg-spare --bg-spare '*)
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+    esac
+  done <<EOF
+$pids
+EOF
+  return 1
+}
+
 # Print the last (outermost) pid of ancestry list $1, or return 1 when empty.
 _fm_harness_outermost_pid() {  # <ancestry-pids>
   local pid outermost=''

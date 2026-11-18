@@ -73,6 +73,8 @@ A re-emit (`--reemit`) reprints the digest for a process that already has the he
 | `resume`, `reload`, `fork` | Nothing when the lock holder is this process or a near ancestor, otherwise full digest | Prior context is restored, so re-running is redundant when the lock is still ours; a new process that resumed an old session has not taken the helm, so the adapter takes it. |
 | unreadable or unrecognized | Full digest | Taking the helm redundantly is cheap and idempotent; not taking it is the bug this tier exists to fix. |
 
+Two Claude refinements sit on top of this table: a [background copy](#background-copies) never runs a full digest for a lock it does not own, and a context-preserving open that owns the lock while the home needs supervision gets a [resume wake](#resume-wake).
+
 ### Change from the previous nudge matcher
 
 This routing deliberately inverts the previous nudge matcher, which fired on `startup|resume|clear` and excluded `compact`.
@@ -111,6 +113,25 @@ For `resume`, `reload`, and `fork`, the run wrapper uses the same ancestry check
 A background Claude helper-chain recycle can break that ancestry.
 The wrapper may then run a redundant full digest even though the shared same-session verdict still owns the lock.
 That session start remains idempotent, because `bin/fm-lock.sh` treats the same-session lock as its own.
+
+### Background copies
+
+Claude Code can continue a conversation in a background process, `claude bg-spare`, for example after the exit dialog's "Move to background and exit".
+That copy fires its own session-open hook in the home, and taking a free lock there would leave the captain's own session read-only when it opens or resumes the same conversation.
+So before any full digest the run wrapper asks `fm_harness_ancestry_bg_spare_pid` in `bin/fm-session-lock-lib.sh` whether its contiguous harness ancestry contains a spare.
+The flag counts only in the argument position Claude Code dispatches on, never later in argv, and no environment is read.
+A copy that does not already own the lock prints a `SESSION START - BACKGROUND COPY` notice instead of the digest: it leaves the lock free and tells that copy's model to keep away from the fleet unless the captain makes it the first mate.
+A copy that already owns the lock, such as a session whose model loop moved into a spare, keeps the helm through the ordinary routing.
+
+### Resume wake
+
+A resumed session has no supervision cycle of its own until one of its turns ends, because watcher continuity on Claude is owned by the Stop hook ([`turnend-guard.md`](turnend-guard.md)).
+Wakes delivered meanwhile go to the previous process's cycle, whose rewake cannot reach the new one.
+So for `resume`, `reload`, and `fork` the run wrapper checks, after its ordinary routing, whether the session owns the lock under a trusted Claude session id, the home needs supervision, and `state/.afk` is absent.
+When all hold and jq is available, it writes a `watcher` operational-input record that asks for a drain and prints Claude's SessionStart JSON: the digest, if any, as `additionalContext`, and the record's doorbell as `initialUserMessage`.
+Claude then starts a turn before the captain types, the turn drains and acknowledges queued work, and its end arms supervision the ordinary Stop-owned way.
+Any other harness, condition, or failure on that path keeps the plain output above.
+The acknowledged hand-back retry cannot cover this case, because its owner stops once the session-lock holder changes ([`supervision-host.md`](supervision-host.md#reaching-a-lost-claude-continuation)).
 
 ### Re-emit mechanics
 
@@ -415,6 +436,8 @@ It proves the run wrapper's source routing end to end against a real `fm-session
 
 - Completion-gated `--reemit` selection.
 - Context-preserving resume: silence when the lock holder is an ancestor, and the full digest with the lock acquired when it is not.
+- Background copies: a Claude-shaped `bg-spare` process never takes a free lock and prints its notice for startup, resume, and compact, while the same process with the flag outside the dispatch position takes the helm, and a copy that already owns the lock keeps it.
+- The resume wake: a resumed Claude session that needs supervision gets the JSON wake with or without a digest, while an idle home, away mode, and an untrusted session id each keep the plain output.
 - Pi CLI continuation classification.
 - An unrecognized source falling through to the full digest.
 - Bounded loud delivery of an oversized Pi digest.
@@ -465,6 +488,7 @@ It uses a TERM-resistant digest that exceeds its budget and proves that the dige
 `tests/fm-sessionstart-hook-live-e2e.test.sh` is the opt-in live guard for the Claude, Codex exec, and Pi run-tier adapters.
 It confirms each installed adapter in that suite invokes the run wrapper and delivers its output into context.
 It verifies context-preserving reopen sources for those adapters, and context-reset delivery wherever their tracked TUI surface is reachable.
+On Claude it also proves that an interactive resume runs a SessionStart `initialUserMessage` as a turn with the hook's `additionalContext` in context, which the resume wake relies on.
 
 Its separate `FM_PI_SESSIONSTART_RACE_LIVE_E2E=1` mode uses real Pi with an offline deterministic provider and a barrier-controlled `/new` digest.
 That mode proves both an immediate prompt and a completed-before-prompt control make their first provider call with exactly one native startup context and no manual execution.
