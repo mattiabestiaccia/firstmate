@@ -235,6 +235,10 @@
 #   checks and closes the scout as discarded with no report recorded, and
 #   discards secondmate child work for kind=secondmate. Only use it when the
 #   captain has explicitly said to discard the work.
+#   If a durable Treehouse lease changed but status proves the slot is available
+#   with no lease, --force retires only the endpoint and task records/backlog;
+#   no process scan, branch cleanup or return touches that copy. Another lease
+#   or unreadable/ambiguous status still refuses, including with --force.
 #   --legacy-record accepts a task record that predates the spawn_gen field:
 #   teardown then proceeds only when the recorded endpoint is confirmed dead or
 #   agent-less (bin/fm-backend.sh's recovery-grade classifier), and without
@@ -1331,13 +1335,30 @@ fi
 # validator rather than probing or closing an ambient current window.
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+TEARDOWN_SLOT_AVAILABLE=0
 if [ -n "$(fm_meta_get "$META" treehouse_lease_id)" ]; then
   # shellcheck source=bin/fm-task-handoff-lib.sh
   . "$SCRIPT_DIR/fm-task-handoff-lib.sh"
-  fm_task_handoff_verify "$META" "$ID" "$FM_HOME" || {
-    echo 'error: durable Treehouse lease changed; teardown preserves the copy' >&2
-    exit 1
-  }
+  if ! fm_task_handoff_verify "$META" "$ID" "$FM_HOME"; then
+    # The project lock acquired above stays held through record cleanup. Only
+    # an unambiguously returned slot licenses forced record-only retirement;
+    # another lease, duplicate rows or unreadable status never does.
+    available_path=$(cd "$WT" 2>/dev/null && pwd -P) || available_path=
+    if [ "$FORCE" = --force ] && [ "$TREEHOUSE_PROJECT_LOCK_HELD" = 1 ] \
+       && [ -n "$available_path" ] \
+       && fm_treehouse_pool_slot "$PROJ" "$WT" \
+       && available_rows=$(cd "$PROJ" && treehouse status --json) \
+       && printf '%s' "$available_rows" | jq -e --arg p "$available_path" '
+         [.[] | select(.path == $p)] | length == 1 and
+         (.[0] | .status == "available" and
+          ((.lease_holder // "") == "") and ((.lease_id // "") == ""))' >/dev/null; then
+      TEARDOWN_SLOT_AVAILABLE=1
+      echo 'teardown: copy already returned to the pool; closing only the task record' >&2
+    else
+      echo 'error: durable Treehouse lease changed; teardown preserves the copy' >&2
+      exit 1
+    fi
+  fi
 fi
 T_ORCA=
 if [ "$TEARDOWN_WINDOWLESS" = 1 ]; then
@@ -2861,6 +2882,7 @@ TEARDOWN_SLOT_REASSIGNED_TO=
 TEARDOWN_SLOT_REASSIGNED_HOME=
 require_owned_task_worktree_slot() {
   local slot rc=0
+  [ "$TEARDOWN_SLOT_AVAILABLE" != 1 ] || return 0
   slot=$(teardown_live_slot_path) || return 0
   require_owned_worktree_slot_record "$ID" "$slot" || rc=$?
   case "$rc" in
@@ -2876,7 +2898,7 @@ require_owned_task_worktree_slot() {
 }
 
 teardown_owns_worktree() {
-  [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ]
+  [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ] && [ "$TEARDOWN_SLOT_AVAILABLE" != 1 ]
 }
 
 firstmate_home_has_treehouse_slot() {
@@ -4415,6 +4437,8 @@ if [ "$TEARDOWN_POOL_SLOT_LOST" = 1 ]; then
   echo "teardown $ID finished its cleanup and removed its task record, but a returned pool slot did not come back clean (see the warning above); clear those paths so the pool can reuse the slot" >&2
 elif [ "$TEARDOWN_LEGACY_ACCEPTED" = 1 ]; then
   echo "teardown $ID complete (window ${T:-none}, worktree $WT, legacy record accepted without spawn_gen: endpoint $TEARDOWN_LEGACY_ENDPOINT, incarnation $TEARDOWN_META_SPAWN_GEN)"
+elif [ "$TEARDOWN_SLOT_AVAILABLE" = 1 ]; then
+  echo "teardown $ID complete (window ${T:-none}; copy already returned to the pool, task record only)"
 elif teardown_owns_worktree; then
   echo "teardown $ID complete (window ${T:-none}, worktree $WT)"
 else

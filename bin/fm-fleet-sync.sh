@@ -11,7 +11,8 @@
 # is left untouched and reported as a quantified, loud "STUCK: ... N commits behind
 # ... - needs attention" warning rather than a quiet drift. Nothing is ever forced,
 # stashed, or discarded.
-# Still skips (benignly) local-only/no-origin projects, missing remotes/branches,
+# Local-only projects sync only from a local-path origin, without branch pruning.
+# Still skips (benignly) other local-only/no-origin projects, missing remotes/branches,
 # and fetch failures. A project whose registry entry bin/fm-project-mode.sh
 # refuses is skipped too, naming that command so its refusal is readable, rather
 # than synced under a guessed posture.
@@ -334,8 +335,19 @@ sync_project() {
   fi
   mode=${mode_line%% *}
   if [ "$mode" = "local-only" ]; then
-    echo "$label: skipped: local-only project"
-    return 0
+    # get-url expands insteadOf rules, so a path rewritten to a network URL
+    # cannot accidentally opt a local-only project into network access.
+    origin=$(git -C "$PROJ" remote get-url origin 2>/dev/null) || origin=
+    case "$origin" in
+      ''|*:*|-*)
+        echo "$label: skipped: local-only project without a local-path origin"
+        return 0
+        ;;
+    esac
+    if ! (cd "$PROJ" && [ -d "$origin" ]); then
+      echo "$label: skipped: local-only origin is not a local directory"
+      return 0
+    fi
   fi
   if ! git -C "$PROJ" remote get-url origin >/dev/null 2>&1; then
     echo "$label: skipped: no origin remote"
@@ -351,7 +363,9 @@ sync_project() {
     return 0
   fi
 
-  prune_gone_branches || true
+  if [ "$mode" != "local-only" ]; then
+    prune_gone_branches || true
+  fi
 
   DEFAULT=$(default_branch) || {
     echo "$label: skipped: cannot determine default branch"

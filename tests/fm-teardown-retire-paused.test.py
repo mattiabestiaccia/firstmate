@@ -109,6 +109,36 @@ class Home:
   after=self.snapshot();assert after==before,(args,sorted(k for k in set(before)|set(after) if before.get(k)!=after.get(k)))
   return r
 with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
+ # A returned pool copy permits only explicit forced record retirement.
+ for name,rows in [('available',[{'status':'available'}]),
+                   ('leased-other',[{'status':'leased','lease_holder':'another-task','lease_id':'new'}]),
+                   ('available-stale-lease',[{'status':'available','lease_id':'still-leased'}]),
+                   ('duplicate',[{'status':'available'},{'status':'available'}]),
+                   ('missing',[])]:
+  h=Home(tmp,'returned-'+name,paused=None)
+  (h.H/'treehouse-rows.json').write_text(json.dumps([dict(row,path=str(h.wt)) for row in rows])+'\n')
+  h.refused('--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+  if name!='available':
+   h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+   continue
+  def copy_snapshot():
+   return {str(p.relative_to(h.H/'pool')):(os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else 'dir') for p in (h.H/'pool').rglob('*')}
+  before=copy_snapshot()
+  refs=run(['git','-C',str(h.proj),'show-ref'],h.env).stdout
+  r=h.teardown('--force','--skip-orphan-sweep')
+  assert r.returncode==0,(r.returncode,r.stdout,r.stderr)
+  assert 'closing only the task record' in r.stderr,r.stderr
+  assert copy_snapshot()==before,'returned copy or owner claim changed'
+  assert run(['git','-C',str(h.proj),'show-ref'],h.env).stdout==refs,'branches changed'
+  assert not h.meta.exists(),'task metadata retained'
+  assert not (h.H/'hc'/(TERMINAL+'.json')).exists(),'endpoint retained'
+  assert '- [x] '+ID in (h.data/'backlog.md').read_text(),'backlog not closed'
+  assert not any(line.startswith('return ') for line in (h.H/'treehouse.log').read_text().splitlines()),'returned copy twice'
+ passed('returned slots require force and close only records; another lease, stale lease fields, duplicate or missing rows refuse')
+ h=Home(tmp,'returned-unreadable',paused=None)
+ (h.H/'treehouse-rows.json').write_text('not JSON\n')
+ h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+ passed('unreadable returned-slot status refuses even with force')
  # (i) Without the option a paused task is refused with today's exact bytes and exit status.
  h=Home(tmp,'plain')
  for args in [('--skip-orphan-sweep',),('--skip-orphan-sweep','--no-prune'),()]:

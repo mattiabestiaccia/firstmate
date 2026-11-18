@@ -9,7 +9,7 @@
 #   - every other off-default state is left untouched and reported as a loud,
 #     quantified "STUCK: ... N commits behind ... - needs attention" warning
 #     instead of a quiet skip.
-# The pre-existing fast-forward / already-current / local-only / no-origin paths
+# The pre-existing fast-forward / already-current / no-origin paths
 # must be unchanged, and bootstrap must relay the new outcomes as FLEET_SYNC lines.
 #
 # It also pins the clone-root guard: a plain directory under projects/ resolves,
@@ -395,19 +395,37 @@ test_no_origin_skipped() {
   pass "no-origin clone is skipped (benign), not flagged STUCK"
 }
 
-test_local_only_skipped() {
-  local home clone out
+test_local_only_origin_sync() {
+  local home clone out before
   home=$(new_home)
   clone=$(build_pair "$home" iota)
+  git -C "$clone" remote set-url origin ../../remotes/iota.git
   advance_origin "$home" iota C1
   mkdir -p "$home/data"
   printf -- '- iota [local-only] - test project (added 2026-06-27)\n' > "$home/data/projects.md"
 
   out=$(run_sync "$home" "$clone")
+  assert_contains "$out" "iota: synced" "local-only path origin fast-forwards"
+  [ "$(head_sha "$clone")" = "$(git -C "$clone" rev-parse origin/main)" ] || fail "local-only clone not advanced"
 
-  assert_contains "$out" "iota: skipped: local-only project" "local-only clone is skipped as before"
-  assert_not_contains "$out" "STUCK" "local-only skip is not escalated to STUCK"
-  pass "local-only clone is skipped (benign), not flagged STUCK"
+  commit_file "$clone" local.txt local "local divergent commit"
+  before=$(head_sha "$clone")
+  advance_origin "$home" iota C2
+  out=$(run_sync "$home" "$clone")
+  assert_contains "$out" "iota: STUCK:" "non-fast-forward local-only refuses"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "divergent local-only clone moved"
+
+  git -C "$clone" remote set-url origin https://example.invalid/repo.git
+  out=$(run_sync "$home" "$clone")
+  assert_contains "$out" "iota: skipped: local-only project" "network local-only origin is skipped"
+  assert_not_contains "$out" "fetch failed" "network origin must not be fetched"
+
+  git -C "$clone" config url.https://example.invalid/.insteadOf "$home/remotes/"
+  git -C "$clone" remote set-url origin "$home/remotes/iota.git"
+  out=$(run_sync "$home" "$clone")
+  assert_contains "$out" "iota: skipped: local-only project" "rewritten path origin is skipped"
+  assert_not_contains "$out" "fetch failed" "rewritten network origin must not be fetched"
+  pass "local-only path origins fast-forward, divergence refuses, network origins skip"
 }
 
 # A registry entry the parser refuses resolves to no posture at all, so sync must
@@ -756,7 +774,7 @@ test_diverged_is_stuck_untouched
 test_on_default_clean_behind_fast_forwards
 test_already_current_unchanged
 test_no_origin_skipped
-test_local_only_skipped
+test_local_only_origin_sync
 test_unresolvable_registry_posture_skipped
 test_single_project_by_bare_name_resolves
 test_single_project_by_bare_name_ignores_cwd_shadow
