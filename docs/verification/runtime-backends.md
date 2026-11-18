@@ -410,6 +410,29 @@ Removing the `--force` arm makes the forced generic case refuse; honoring `--for
 Restoring `fm_backend_orca_kill`'s swallowed tool check makes the CLI-absent adapter case report success.
 Dropping the retention-is-not-durable line makes the refusal claim a retention teardown does not own.
 
+### Treehouse task endpoint ordering and returned-copy recovery
+
+2026-11-18: the synthetic hc/Treehouse regression uses fake hc 0.1.14, fake process snapshots, and real Git and tasks-axi.
+`bin/fm-teardown.sh`'s header owns the current cleanup ordering and records-only recovery contract.
+The early hc/tmux close for an existing task copy is not the force-overridable generic close described above; the generic close still handles absent copies and other adapters.
+
+```sh
+python3 tests/fm-teardown-retire-paused.test.py
+# "passed": 17
+```
+
+The grouped cases include endpoint descendants, foreign processes, a known reassigned lease, unchanged copy/claim/new-holder records, an unprovable process table, a copy still busy after close, and close-before-return failure ordering.
+The new exact hc/tmux process-root case in `tests/fm-backend-hc.test.sh` also passed, but that full suite stopped on process inspection denied by the execution sandbox (`ps` exit 126); it is not a passing-suite result.
+No real endpoint or Treehouse pool was exercised by this run.
+The kernel process proof and full affected backend suites require an unrestricted host run:
+
+```sh
+FM_TEARDOWN_REAL_PS=1 python3 tests/fm-teardown-retire-paused.test.py
+bash bin/fm-test-run.sh tests/fm-backend-hc.test.sh tests/fm-backend-tmux-smoke.test.sh tests/fm-teardown.test.sh tests/fm-teardown-endpoint-safety.test.sh
+```
+
+The opt-in Python case uses real parent/child and unrelated processes with synthetic endpoint and pool commands, not a live Herdr terminal.
+
 ## Kimi folder prompt
 
 Verified on 2026-10-23 on Linux with tmux 3.6 against Kimi Code CLI 2.3.0 and 2.3.1, each installed into an isolated prefix and launched with a disposable home and its updater off.

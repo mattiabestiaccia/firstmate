@@ -1323,6 +1323,30 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   return "$rc"
 }
 
+# fm_backend_endpoint_process_root: a kernel PID bound to the exact endpoint.
+# hc exposes the foreground root only, not the terminal shell's PID. This is
+# deliberately an under-approximation: ancestors and sibling jobs cannot be
+# authorized from it. An unknown backend or an unreadable identity refuses.
+fm_backend_endpoint_process_root() {  # <backend> <target> <expected-label>
+  local backend=$1 target=$2 expected=$3 json root
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux)
+      [ "${target#*:}" = "$expected" ] || return 1
+      json=$(fm_backend_tmux_window_id "${target%%:*}" "$expected") || return 1
+      root=$(tmux display-message -p -t "$json" '#{pane_pid}') || return 1
+      ;;
+    hc)
+      fm_backend_hc_target_ready "$target" "$expected" || return 1
+      json=$(fm_backend_hc_get "$target") || return 1
+      root=$(printf '%s' "$json" | jq -er '.foreground.pid | select(type == "number" and . > 1 and . == floor)') || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  case "$root" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  printf '%s\n' "$root"
+}
+
 # fm_backend_kill: remove the task's session endpoint. An already-gone target
 # is NOT an error and returns 0 silently, so ordinary cleanup of an
 # already-exited session stays quiet. A nonzero return means the close could

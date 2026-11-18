@@ -455,9 +455,38 @@ PY
   pass 'Claude: native local color command initializes the same named session before launch'
 }
 
+test_endpoint_process_root_is_exact_and_conservative() {
+  local out
+  setup_case process-root
+  write_terminal "$D" t9 live fm-task "$(hometag_of)" fish fish
+  jq '.foreground.pid = 12345' "$D/t9.json" > "$D/t9.tmp" && mv "$D/t9.tmp" "$D/t9.json"
+  out=$(hc_shell 'fm_backend_endpoint_process_root hc fmtest:t9 fm-task')
+  assert_equals "$out" 12345 "hc root comes only from this labeled endpoint"
+  expect_refused hc_shell 'fm_backend_endpoint_process_root hc fmtest:t9 fm-other'
+  jq '.foreground.pid = null' "$D/t9.json" > "$D/t9.tmp" && mv "$D/t9.tmp" "$D/t9.json"
+  expect_refused hc_shell 'fm_backend_endpoint_process_root hc fmtest:t9 fm-task'
+  expect_refused hc_shell 'fm_backend_endpoint_process_root herdr fmtest:t9 fm-task'
+  cat > "$FB/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'list-windows -t =fmtest -F #{window_id}|#{window_index}|#{window_name}')
+    printf '@7|0|fm-task\n@8|1|fm-task-neighbor\n' ;;
+  'display-message -p -t @7 #{pane_pid}') printf '23456\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$FB/tmux"
+  out=$(hc_shell 'fm_backend_endpoint_process_root tmux fmtest:fm-task fm-task')
+  assert_equals "$out" 23456 "tmux root resolves an exact window ID before reading a PID"
+  expect_refused hc_shell 'fm_backend_endpoint_process_root tmux fmtest:fm-task-neighbor fm-task'
+  expect_refused hc_shell 'fm_backend_endpoint_process_root tmux fmtest:fm-missing fm-missing'
+  pass "endpoint process root: exact labeled hc and tmux identity, unknown/foreign/unreadable refuse"
+}
+
 fm_test_run \
   test_worker_names_do_not_change_routing \
   test_claude_color_is_local_before_interactive_launch \
+  test_endpoint_process_root_is_exact_and_conservative \
   test_hc_is_spawn_capable_and_needs_app_signals \
   test_required_tool_check_uses_the_adapter_resolver \
   test_create_task_is_independent_labeled_and_refuses_duplicates \

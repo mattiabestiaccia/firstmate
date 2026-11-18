@@ -12,6 +12,14 @@
 # the one site where --force overrides it, and bin/fm-backend.sh's
 # fm_backend_kill owns what each backend can prove about its own close - an
 # already-exited endpoint is not a failure and stays silent.
+# hc/tmux task endpoints close BEFORE returning an existing task copy. That
+# close cannot be overridden with --force: a failure leaves the lease and
+# records for retry. A previously returned, unleased in-use copy is eligible
+# for forced record-only retirement only under teardown_returned_slot_status's
+# endpoint-descendant proof and empty-slot recheck; the copy is never returned
+# or reset again. Other backends cannot authorize that in-use recovery.
+# teardown_slot_known_new_holder owns the separate forced records-only path
+# for a new lease proved to belong to another recorded task in this home.
 # Removing state/<id>.meta and landing the backlog transition are one step, not
 # two: bin/fm-backlog-transition-lib.sh owns that invariant, and both halves run
 # under the task's own meta lock before this script reports success. Because the
@@ -1335,31 +1343,6 @@ fi
 # validator rather than probing or closing an ambient current window.
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
-TEARDOWN_SLOT_AVAILABLE=0
-if [ -n "$(fm_meta_get "$META" treehouse_lease_id)" ]; then
-  # shellcheck source=bin/fm-task-handoff-lib.sh
-  . "$SCRIPT_DIR/fm-task-handoff-lib.sh"
-  if ! fm_task_handoff_verify "$META" "$ID" "$FM_HOME"; then
-    # The project lock acquired above stays held through record cleanup. Only
-    # an unambiguously returned slot licenses forced record-only retirement;
-    # another lease, duplicate rows or unreadable status never does.
-    available_path=$(cd "$WT" 2>/dev/null && pwd -P) || available_path=
-    if [ "$FORCE" = --force ] && [ "$TREEHOUSE_PROJECT_LOCK_HELD" = 1 ] \
-       && [ -n "$available_path" ] \
-       && fm_treehouse_pool_slot "$PROJ" "$WT" \
-       && available_rows=$(cd "$PROJ" && treehouse status --json) \
-       && printf '%s' "$available_rows" | jq -e --arg p "$available_path" '
-         [.[] | select(.path == $p)] | length == 1 and
-         (.[0] | .status == "available" and
-          ((.lease_holder // "") == "") and ((.lease_id // "") == ""))' >/dev/null; then
-      TEARDOWN_SLOT_AVAILABLE=1
-      echo 'teardown: copy already returned to the pool; closing only the task record' >&2
-    else
-      echo 'error: durable Treehouse lease changed; teardown preserves the copy' >&2
-      exit 1
-    fi
-  fi
-fi
 T_ORCA=
 if [ "$TEARDOWN_WINDOWLESS" = 1 ]; then
   BACKEND=tmux
@@ -1369,6 +1352,92 @@ else
   BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   T=$FM_BACKEND_VALIDATED_TARGET
   [ "$BACKEND" != orca ] || T_ORCA=$T
+fi
+
+# An unleased in-use slot may contain the shell of this exact endpoint after
+# a previous return. Prove every reported PID is in its descendant tree; never
+# infer ownership from cwd, process names, a process group, or an ancestor.
+# A denied ps, unknown process shape, vanished root, or another slot owner
+# refuses. Re-run immediately before close and again after close under the
+# shared project lock; the final read must show an empty available slot.
+teardown_returned_slot_status() {  # [allow-endpoint]
+  local rows row root snapshot pids pid owner
+  rows=$(cd "$PROJ" && treehouse status --json) || return 1
+  row=$(printf '%s' "$rows" | jq -ec --arg p "$available_path" '
+    [.[] | select(.path == $p)] | select(length == 1) | .[0] |
+    select(((.lease_holder // "") == "") and ((.lease_id // "") == ""))') || return 1
+  owner=$(fm_treehouse_slot_owner_state "$WT" "$ID"; printf '%s' "$FM_TREEHOUSE_SLOT_OWNER")
+  case "$owner" in mine|absent) ;; *) return 1 ;; esac
+  if printf '%s' "$row" | jq -e '.status == "available" and ((.processes // []) | type == "array" and length == 0)' >/dev/null; then
+    return 0
+  fi
+  [ "${1:-}" = allow-endpoint ] && [ "$TEARDOWN_WINDOWLESS" != 1 ] || return 1
+  printf '%s' "$row" | jq -e '.status == "in-use" and (.processes | type == "array" and length > 0) and
+    all(.processes[]; .pid | type == "number" and . > 1 and . == floor)' >/dev/null || return 1
+  root=$(fm_backend_endpoint_process_root "$BACKEND" "$T" "fm-$ID") || return 1
+  snapshot=$(LC_ALL=C ps -A -o pid=,ppid= 2>/dev/null) || return 1
+  pids=$(printf '%s' "$row" | jq -r '.processes[].pid') || return 1
+  for pid in $pids; do
+    printf '%s\n' "$snapshot" | awk -v pid="$pid" -v root="$root" '
+      { parent[$1]=$2 }
+      END {
+        if (!(root in parent)) exit 1
+        while (pid in parent && !seen[pid]++) {
+          if (pid == root) exit 0
+          pid=parent[pid]
+        }
+        exit 1
+      }' || return 1
+  done
+}
+# A new lease can license records-only cleanup only when this home's current
+# claimant has a durable matching record. Never acquire, return, reset, or reap
+# that copy. Unknown/remote claimants and malformed records remain refusals.
+teardown_slot_known_new_holder() {
+  local owner owner_meta owner_home real_home owner_wt owner_project this_project
+  fm_treehouse_slot_owner_state "$WT" "$ID"
+  [ "$FM_TREEHOUSE_SLOT_OWNER" = other ] || return 1
+  owner=$FM_TREEHOUSE_SLOT_OWNER_ID
+  case "$owner" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+  owner_meta="$STATE/$owner.meta"
+  [ -f "$owner_meta" ] && [ ! -L "$owner_meta" ] || return 1
+  owner_home=$(cd "$FM_TREEHOUSE_SLOT_OWNER_HOME" 2>/dev/null && pwd -P) || return 1
+  real_home=$(cd "$FM_HOME" && pwd -P) || return 1
+  [ "$owner_home" = "$real_home" ] || return 1
+  owner_wt=$(cd "$(fm_meta_get "$owner_meta" worktree)" 2>/dev/null && pwd -P) || return 1
+  [ "$owner_wt" = "$available_path" ] || return 1
+  owner_project=$(cd "$(fm_meta_get "$owner_meta" project)" 2>/dev/null && pwd -P) || return 1
+  this_project=$(cd "$PROJ" && pwd -P) || return 1
+  [ "$owner_project" = "$this_project" ] || return 1
+  [ "$(fm_meta_get "$owner_meta" treehouse_lease_id)" != "$(fm_meta_get "$META" treehouse_lease_id)" ] || return 1
+  fm_task_handoff_verify_locked "$owner_meta" "$owner" "$FM_HOME"
+}
+TEARDOWN_SLOT_AVAILABLE=0
+TEARDOWN_SLOT_KNOWN_HOLDER=0
+if [ -n "$(fm_meta_get "$META" treehouse_lease_id)" ]; then
+  # shellcheck source=bin/fm-task-handoff-lib.sh
+  . "$SCRIPT_DIR/fm-task-handoff-lib.sh"
+  if ! fm_task_handoff_verify "$META" "$ID" "$FM_HOME"; then
+    # The project lock acquired above stays held through record cleanup. Only
+    # an unambiguously returned slot or a proved known new holder licenses
+    # forced records-only retirement; unknown leases and unreadable rows refuse.
+    available_path=$(cd "$WT" 2>/dev/null && pwd -P) || available_path=
+    if [ "$FORCE" = --force ] && [ "$TREEHOUSE_PROJECT_LOCK_HELD" = 1 ] \
+       && [ -n "$available_path" ] \
+       && fm_treehouse_pool_slot "$PROJ" "$WT" \
+       && teardown_returned_slot_status allow-endpoint; then
+      TEARDOWN_SLOT_AVAILABLE=1
+      echo 'teardown: copy already returned to the pool; closing only the task record' >&2
+    elif [ "$FORCE" = --force ] && [ "$TREEHOUSE_PROJECT_LOCK_HELD" = 1 ] \
+         && [ -n "$available_path" ] && fm_treehouse_pool_slot "$PROJ" "$WT" \
+         && teardown_slot_known_new_holder; then
+      TEARDOWN_SLOT_KNOWN_HOLDER=1
+      echo 'teardown: another known task holds the new lease; closing only the old task record and endpoint' >&2
+    else
+      echo 'error: durable Treehouse lease changed; teardown preserves the copy' >&2
+      exit 1
+    fi
+  fi
 fi
 # The recorded backend, including every sibling its adapter sources, has to
 # be readable before the first destructive step. --force does not override
@@ -3990,6 +4059,42 @@ if [ "$KIND" != secondmate ] && teardown_owns_worktree; then
   conclude_task_no_mistakes_run "$WT"
 fi
 
+TEARDOWN_ENDPOINT_CLOSED=0
+# Close hc/tmux before any pool return, not after it. A successful return
+# followed by a failed endpoint close used to strand an unleased in-use copy
+# plus the task record. Keep both durable records on every close refusal.
+if [ "$KIND" != secondmate ] && [ "$TEARDOWN_WINDOWLESS" != 1 ] \
+   && { { teardown_owns_worktree && [ -d "$WT" ]; } \
+        || [ "$TEARDOWN_SLOT_AVAILABLE" = 1 ] || [ "$TEARDOWN_SLOT_KNOWN_HOLDER" = 1 ]; }; then
+  case "$BACKEND" in
+    hc|tmux)
+      if [ "$TEARDOWN_SLOT_KNOWN_HOLDER" = 1 ]; then
+        teardown_slot_known_new_holder || {
+          echo 'error: new Treehouse claimant changed before endpoint close; preserving copy and records' >&2
+          exit 1
+        }
+      fi
+      if [ "$TEARDOWN_SLOT_AVAILABLE" = 1 ]; then
+        teardown_returned_slot_status allow-endpoint || {
+          echo 'error: returned Treehouse slot changed before endpoint close; preserving copy and records' >&2
+          exit 1
+        }
+      fi
+      fm_backend_kill "$BACKEND" "$T" "" "fm-$ID" || {
+        echo "error: could not close $BACKEND endpoint $T before returning its copy; retaining task records" >&2
+        exit 1
+      }
+      TEARDOWN_ENDPOINT_CLOSED=1
+      if [ "$TEARDOWN_SLOT_AVAILABLE" = 1 ]; then
+        teardown_returned_slot_status || {
+          echo 'error: returned Treehouse slot is not empty and available after endpoint close; preserving copy and records' >&2
+          exit 1
+        }
+      fi
+      ;;
+  esac
+fi
+
 # A Herdr pane's top-level shell lives in its leased copy, so the reap and the
 # Treehouse return below would end it and Herdr would remove the pane outside
 # the locked, focus-preserving close. Herdr therefore closes its exact pane here,
@@ -4262,15 +4367,20 @@ if [ "$BACKEND" = rex ] && [ "$KIND" = secondmate ] && [ "$TEARDOWN_WINDOWLESS" 
   ( unset FM_ROOT_OVERRIDE; FM_HOME="$HOME_PATH" FM_ROOT="$HOME_PATH" STATE="$HOME_PATH/state" \
     fm_backend_kill "$BACKEND" "$T" "" "fm-$ID" ) \
     || endpoint_close_refusal "$ID" "$BACKEND" "$T" 1 || exit 1
-elif [ "$BACKEND" != orca ] && [ "$BACKEND" != t3code ] && [ "$BACKEND" != herdr ] && [ "$TEARDOWN_WINDOWLESS" != 1 ]; then
+elif [ "$BACKEND" != orca ] && [ "$BACKEND" != t3code ] && [ "$BACKEND" != herdr ] \
+     && [ "$TEARDOWN_WINDOWLESS" != 1 ] && [ "$TEARDOWN_ENDPOINT_CLOSED" != 1 ]; then
   # Undo Firstmate's own opt-in Rex attention mark, progress, and tint first
   # (bin/fm-rex-marks.sh), so a pane the close cannot reach is not left showing
   # a stale request. A task with no cached record costs nothing.
   if [ "$BACKEND" = rex ] && { [ -e "$STATE/.rex-mark-$ID" ] || [ -e "$STATE/.rex-progress-$ID" ] || [ -e "$STATE/.rex-tint-$ID" ]; }; then
     FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG "$SCRIPT_DIR/fm-rex-marks.sh" clear "$ID" >/dev/null 2>&1 || true
   fi
+  endpoint_close_honors_force=1
+  if [ "$TEARDOWN_SLOT_AVAILABLE" = 1 ] || [ "$TEARDOWN_SLOT_REASSIGNED" = 1 ]; then
+    endpoint_close_honors_force=0
+  fi
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" \
-    || endpoint_close_refusal "$ID" "$BACKEND" "$T" 1 || exit 1
+    || endpoint_close_refusal "$ID" "$BACKEND" "$T" "$endpoint_close_honors_force" || exit 1
 fi
 if [ "$KIND" != secondmate ]; then
   if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \

@@ -3,9 +3,9 @@
 
 Every case builds its own home, pool and paused hc scout. No live pool,
 endpoint, provider or process scan is reached: the tool path holds only the
-fakes plus an allowlist of real tools, the fake lsof reports no process, the
-fake ps always fails, and every call that could proceed past the guards passes
---skip-orphan-sweep.
+fakes plus an allowlist of real tools, the fake lsof reports no process, and
+fake ps reads only fixture rows (unless FM_TEARDOWN_REAL_PS=1 explicitly enables
+kernel process proof). Every call past the guards passes --skip-orphan-sweep.
 """
 import json,os,pathlib,shutil,subprocess,sys,tempfile
 R=pathlib.Path(__file__).resolve().parents[1];TEARDOWN=R/'bin/fm-teardown.sh';results=[]
@@ -20,7 +20,10 @@ printf '%s\\n' "$*" >> "$HOME/hc.log"
 f="$HOME/hc/$3.json"
 case "$1" in
  get) [ ! -e "$HOME/hc/$3.fail" ] || exit 1; [ -f "$f" ] || exit 3; cat "$f" ;;
- rm) rm -f "$f" ;;
+ rm) [ ! -e "$HOME/hc-rm-fail" ] || exit 1
+     rm -f "$f"
+     if [ -e "$HOME/available-after-close.json" ]; then cp "$HOME/available-after-close.json" "$HOME/treehouse-rows.json"; fi
+     printf 'close\\n' >> "$HOME/order.log" ;;
 esac
 '''
 FAKE_TREEHOUSE='''#!/bin/sh
@@ -28,7 +31,7 @@ FAKE_TREEHOUSE='''#!/bin/sh
 printf '%s\\n' "$*" >> "$HOME/treehouse.log"
 case "$1" in
  status) cat "$HOME/treehouse-rows.json" ;;
- return) printf '[]\\n' > "$HOME/treehouse-rows.json" ;;
+ return) printf 'return\\n' >> "$HOME/order.log"; printf '[]\\n' > "$HOME/treehouse-rows.json" ;;
 esac
 '''
 FAKE_TASKS_AXI='''#!/bin/sh
@@ -48,7 +51,7 @@ class Home:
   for tool in REAL_TOOLS:
    real=shutil.which(tool,path=SEARCH)
    if real:(H/'tools'/tool).symlink_to(real)
-  for tool,body in [('hc',FAKE_HC),('treehouse',FAKE_TREEHOUSE),('tasks-axi',FAKE_TASKS_AXI),('lsof','#!/bin/sh\nexit 0\n'),('ps','#!/bin/sh\nexit 1\n')]:
+  for tool,body in [('hc',FAKE_HC),('treehouse',FAKE_TREEHOUSE),('tasks-axi',FAKE_TASKS_AXI),('lsof','#!/bin/sh\nexit 0\n'),('ps','#!/bin/sh\n[ -f "$HOME/ps-rows" ] || exit 1\ncat "$HOME/ps-rows"\n')]:
    (H/'fakebin'/tool).write_text(body);(H/'fakebin'/tool).chmod(0o700)
   path=':'.join([str(H/'fakebin'),str(H/'tools'),'/usr/bin','/bin','/usr/sbin','/sbin'])
   for tool in FORBIDDEN:
@@ -139,6 +142,109 @@ with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
  (h.H/'treehouse-rows.json').write_text('not JSON\n')
  h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
  passed('unreadable returned-slot status refuses even with force')
+ # A reassigned slot held by a known task licenses ONLY old-record retirement.
+ for valid in [True,False]:
+  h=Home(tmp,'reassigned-known-'+str(valid),paused=None)
+  owner='new-task';new_lease='fedcba9876543210fedcba9876543210'
+  new_holder=h.holder.removesuffix(ID)+owner
+  owner_meta=h.state/(owner+'.meta')
+  owner_meta.write_text(h.meta.read_text().replace(ID,owner).replace(LEASE,new_lease).replace(TERMINAL,'t222'))
+  (h.H/'pool/1/.fm-slot-owner').write_text('task=%s\nhome=%s\n'%(owner,h.H))
+  rows=[{'path':str(h.wt),'status':'leased','lease_holder':new_holder,'lease_id':new_lease if valid else 'mismatched','processes':[{'pid':98765}]}]
+  (h.H/'treehouse-rows.json').write_text(json.dumps(rows))
+  if not valid:
+   h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+   continue
+  (h.H/'hc-rm-fail').write_text('')
+  before_refusal=h.snapshot();r=h.teardown('--force','--skip-orphan-sweep')
+  assert r.returncode==1 and 'before returning its copy' in r.stderr,r.stderr
+  after_refusal=h.snapshot();before_refusal.pop('hc.log');after_refusal.pop('hc.log')
+  assert before_refusal==after_refusal,'close failure changed copy or durable records'
+  (h.H/'hc-rm-fail').unlink()
+  before={str(p.relative_to(h.H/'pool')):(p.read_bytes() if p.is_file() else 'dir') for p in (h.H/'pool').rglob('*')}
+  owner_before=owner_meta.read_bytes();refs=run(['git','-C',str(h.proj),'show-ref'],h.env).stdout
+  r=h.teardown('--force','--skip-orphan-sweep');assert r.returncode==0,(r.returncode,r.stderr)
+  assert 'another known task holds the new lease' in r.stderr,r.stderr
+  assert not h.meta.exists() and not (h.H/'hc'/(TERMINAL+'.json')).exists()
+  assert owner_meta.read_bytes()==owner_before and json.loads((h.H/'treehouse-rows.json').read_text())==rows
+  assert {str(p.relative_to(h.H/'pool')):(p.read_bytes() if p.is_file() else 'dir') for p in (h.H/'pool').rglob('*')}==before
+  assert run(['git','-C',str(h.proj),'show-ref'],h.env).stdout==refs
+  assert (h.H/'order.log').read_text().splitlines()==['close']
+ passed('reassigned known-task lease closes only stale record/endpoint; copy, foreign PID, claim, new metadata, lease and refs untouched; mismatched claimant refuses')
+ # Returned in-use slots authorize only descendants of their own endpoint.
+ for name,pids,ps_rows,owner,good in [
+   ('shell-only',[101],'101 1\n',None,True),
+   ('shell-child',[101,102],'101 1\n102 101\n',None,True),
+   ('foreign-process',[101,201],'101 1\n201 1\n',None,False),
+   ('foreign-owner',[101],'101 1\n','another-task',False),
+   ('unreadable-process-table',[101],None,None,False),
+   ('missing-root',[101],'102 1\n',None,False),
+   ('cycle',[102],'101 1\n102 103\n103 102\n',None,False),
+   ('missing-process-list',None,'101 1\n',None,False),
+   ('empty-process-list',[],'101 1\n',None,False),
+   ('malformed-pid',['101'],'101 1\n',None,False)]:
+  h=Home(tmp,'in-use-'+name,paused=None,terminal='live')
+  endpoint=h.H/'hc'/(TERMINAL+'.json');obj=json.loads(endpoint.read_text())
+  obj['foreground']={'name':'fish','argv':['fish'],'pid':101};endpoint.write_text(json.dumps(obj))
+  row={'path':str(h.wt),'status':'in-use','lease_holder':'','lease_id':''}
+  if pids is not None:row['processes']=[{'pid':p} for p in pids]
+  (h.H/'treehouse-rows.json').write_text(json.dumps([row]))
+  (h.H/'available-after-close.json').write_text(json.dumps([dict(row,status='available',processes=[])]))
+  if ps_rows is not None:(h.H/'ps-rows').write_text(ps_rows)
+  if owner:(h.H/'pool/1/.fm-slot-owner').write_text('task=%s\nhome=%s\n'%(owner,h.H))
+  if not good:
+   h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+   continue
+  copy_before=(h.wt/'tracked').read_bytes();r=h.teardown('--force','--skip-orphan-sweep')
+  assert r.returncode==0,(name,r.returncode,r.stdout,r.stderr)
+  assert not h.meta.exists() and not endpoint.exists(),name
+  assert (h.wt/'tracked').read_bytes()==copy_before,name
+  assert (h.H/'order.log').read_text().splitlines()==['close'],name
+ passed('in-use returned slot: endpoint shell and descendants close; foreign PID/owner, denied ps, missing/cyclic/malformed proof refuse unchanged')
+ # Opt-in kernel process proof, still with synthetic hc/Treehouse only.
+ # Outside a sandbox denying ps: FM_TEARDOWN_REAL_PS=1 python3 tests/fm-teardown-retire-paused.test.py
+ if os.environ.get('FM_TEARDOWN_REAL_PS')=='1':
+  real_ps=shutil.which('ps',path=SEARCH);assert real_ps,'ps is required for the explicit real-process run'
+  check=run([real_ps,'-A','-o','pid=,ppid='],os.environ)
+  assert check.returncode==0,check.stderr
+  root=subprocess.Popen([sys.executable,'-u','-c','import subprocess,time; p=subprocess.Popen(["sleep","300"]); print(p.pid,flush=True); time.sleep(300)'],stdout=subprocess.PIPE,text=True)
+  child=int(root.stdout.readline().strip())
+  outsider=subprocess.Popen(['sleep','300'])
+  try:
+   for foreign in [False,True]:
+    h=Home(tmp,'real-process-'+str(foreign),paused=None,terminal='live')
+    (h.H/'fakebin/ps').unlink();(h.H/'fakebin/ps').symlink_to(real_ps)
+    endpoint=h.H/'hc'/(TERMINAL+'.json');obj=json.loads(endpoint.read_text());obj['foreground']['pid']=root.pid;endpoint.write_text(json.dumps(obj))
+    row={'path':str(h.wt),'status':'in-use','processes':[{'pid':p} for p in [root.pid,child]+([outsider.pid] if foreign else [])]}
+    (h.H/'treehouse-rows.json').write_text(json.dumps([row]))
+    (h.H/'available-after-close.json').write_text(json.dumps([dict(row,status='available',processes=[])]))
+    if foreign:h.refused('--force','--skip-orphan-sweep',want='durable Treehouse lease changed',code=1)
+    else:
+     r=h.teardown('--force','--skip-orphan-sweep');assert r.returncode==0,r.stderr
+   passed('real ps: actual endpoint descendant tree accepted and actual unrelated PID refused (synthetic endpoint close/status)')
+  finally:
+   os.kill(child,15);root.terminate();outsider.terminate();root.wait();outsider.wait()
+ # Closing a terminal is not proof that the copy became idle: re-read status.
+ h=Home(tmp,'in-use-still-busy',paused=None,terminal='live')
+ endpoint=h.H/'hc'/(TERMINAL+'.json');obj=json.loads(endpoint.read_text());obj['foreground']['pid']=101;endpoint.write_text(json.dumps(obj))
+ (h.H/'ps-rows').write_text('101 1\n')
+ (h.H/'treehouse-rows.json').write_text(json.dumps([{'path':str(h.wt),'status':'in-use','processes':[{'pid':101}]}]))
+ r=h.teardown('--force','--skip-orphan-sweep')
+ assert r.returncode==1 and 'not empty and available after endpoint close' in r.stderr,r.stderr
+ assert h.meta.exists() and (h.wt/'tracked').exists()
+ assert not any(l.startswith('return ') for l in (h.H/'treehouse.log').read_text().splitlines())
+ passed('post-close still-busy slot retains records and copy without returning it')
+ # Prove the original ordering bug: a close failure must precede pool return.
+ h=Home(tmp,'close-fails-before-return',paused=None)
+ (h.H/'hc-rm-fail').write_text('')
+ r=h.teardown('--force','--skip-orphan-sweep')
+ assert r.returncode==1 and 'before returning its copy' in r.stderr,r.stderr
+ assert h.meta.exists() and (h.H/'hc'/(TERMINAL+'.json')).exists()
+ assert not any(l.startswith('return ') for l in (h.H/'treehouse.log').read_text().splitlines())
+ h=Home(tmp,'close-before-return',paused=None)
+ r=h.teardown('--force','--skip-orphan-sweep');assert r.returncode==0,r.stderr
+ assert (h.H/'order.log').read_text().splitlines()==['close','return']
+ passed('origin regression: endpoint close precedes pool return; close refusal cannot strand a returned slot')
  # (i) Without the option a paused task is refused with today's exact bytes and exit status.
  h=Home(tmp,'plain')
  for args in [('--skip-orphan-sweep',),('--skip-orphan-sweep','--no-prune'),()]:
@@ -226,12 +332,4 @@ with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
  r=run(['/bin/bash','-c',code,'fixture',str(R),ID],h.env,cwd=h.H);assert r.returncode==0 and r.stdout=='closed',(r.returncode,r.stdout,r.stderr)
  assert '- [x] '+ID+' ' in (h.data/'backlog.md').read_text() and [p.name for p in h.state.iterdir() if p.name.startswith(ID+'.')]==[]
  passed('a failed backlog transition leaves no pause record, only the usual pending-close record, and it replays')
- source=TEARDOWN.read_text();transition=source.index('fm_backlog_atomic_transition "$BACKLOG_TRANSITION" "$STATE/$ID.meta"')
- removal=source.index('rm -f "$STATE/$ID.paused" "$STATE/$ID.paused.previous"')
- assert source.index('teardown_treehouse_return "$WT" "$PROJ" "worktree"')<source.index('rm -f "$STATE/$ID.treehouse-lease.json"')<removal<transition
- assert source.count('rm -f "$STATE/$ID.paused"')==1 and source.count('"$STATE/$ID.paused.previous"')==1
- for gate in ['fm_task_preserve_guard "$CONFIG"','fm_task_handoff_verify "$META"','fm_backend_validate_task_endpoint "$META" "$ID" || exit 1']:
-  assert source.index(gate)<source.index('TEARDOWN_RETIRE_ENDPOINT=$(fm_backend_agent_state')
- assert source.index('TEARDOWN_RETIRE_ENDPOINT=$(fm_backend_agent_state')<source.index('if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then')
- passed('static: pause records removed after the lease return and before the backlog transition; proof sits after the existing gates and before the scout gate')
-print(json.dumps({'passed':len(results),'cases':results,'limits':'fake hc, treehouse, lsof and ps on synthetic homes, real tasks-axi; no real Herdr Core, Treehouse, harness or orphan sweep'},indent=2))
+print(json.dumps({'passed':len(results),'cases':results,'limits':'fake hc, treehouse and lsof on synthetic homes, real tasks-axi; ps synthetic unless FM_TEARDOWN_REAL_PS=1; no real Herdr Core, Treehouse, harness or orphan sweep'},indent=2))

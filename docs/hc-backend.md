@@ -111,6 +111,8 @@ A failed launch retains that lease for inspection rather than silently making th
 A repeated fresh spawn under that id refuses while the receipt remains.
 Use the [task control plane](agent-control.md#pausing-a-treehouse-task) for pause and explicit replacement in the same existing terminal.
 A missing terminal is not yet recoverable through hc relaunch.
+Task cleanup closes the endpoint before returning an existing copy; [`fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns forced record-only recovery for returned or reassigned slots.
+Its process proof is conservative: hc's foreground PID authorizes only that PID and its descendants, never ancestors or sibling jobs; unavailable process inspection refuses recovery.
 
 ## Limits
 
