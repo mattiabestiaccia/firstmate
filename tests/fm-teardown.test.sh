@@ -2185,28 +2185,31 @@ test_dirty_return_warns_even_when_a_later_step_refuses() {
   write_meta "$case_dir" no-mistakes scout "$wt"
   prepare_scout_teardown "$case_dir"
   add_treehouse_that_leaves_residue "$case_dir"
-  cat > "$case_dir/fakebin/tmux" <<'SH'
-#!/usr/bin/env bash
-case "${1:-}" in
-  kill-window) exit 1 ;;
-  list-windows) printf '%s\n' fm-task-x1 ;;
-esac
-exit 0
-SH
-  chmod +x "$case_dir/fakebin/tmux"
+  # hc/tmux close before return now: a close refusal cannot lose a pool slot.
+  # Fail record export instead, which really runs AFTER return and must not
+  # suppress the already-issued warning when cleanup exits at that late step.
+  printf '%s\n' relative-export-root > "$case_dir/config/record-export-root"
 
   set +e
   FM_HOME="$case_dir" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  expect_code 1 "$rc" "dirty-return-later-refusal: the endpoint refusal should fail teardown"
-  assert_grep "could not be closed" "$case_dir/stderr" \
-    "dirty-return-later-refusal: fixture did not reach the endpoint close refusal"
+  expect_code 1 "$rc" "dirty-return-later-refusal: the archive refusal should fail teardown"
+  assert_grep "record export archive failed" "$case_dir/stderr" \
+    "dirty-return-later-refusal: fixture did not reach the post-return archive refusal"
   assert_grep "pool slot 8" "$case_dir/stderr" \
     "dirty-return-later-refusal: a later refusal dropped the lost-slot warning"
   assert_grep "left-behind-clone" "$case_dir/stderr" \
     "dirty-return-later-refusal: a later refusal dropped the remaining paths"
+  assert_grep "lost this slot" "$case_dir/stderr" \
+    "dirty-return-later-refusal: a later refusal hid the pool loss"
+  assert_present "$wt/left-behind-clone" \
+    "dirty-return-later-refusal: fixture did not leave actual return residue"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "dirty-return-later-refusal: archive refusal removed the task record"
+  assert_no_grep "teardown task-x1 complete" "$case_dir/stdout" \
+    "dirty-return-later-refusal: archive refusal reported successful cleanup"
   pass "a dirty return is reported even when a later teardown step refuses"
 }
 
