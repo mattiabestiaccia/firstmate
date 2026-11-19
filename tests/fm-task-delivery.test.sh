@@ -1705,6 +1705,12 @@ EOF
     "the ref-format refusal did not name the branch it refused"
   assert_absent "$home/state/branch-agree-a7.meta" "the refused spawn still recorded a task"
 
+  out=$(run_spawn "$home" "$fakebin" branch-agree-a8 "$proj" claude --relaunch --role correzione)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a relaunch carrying --role was accepted"
+  assert_contains "$out" "--relaunch reuses the task's recorded role; --role cannot override it" \
+    "the relaunch refusal did not name the recorded role"
+
   pass "fm-spawn: the brief must carry the spawn's selected ship branch, and the selection is validated before anything is created"
 }
 

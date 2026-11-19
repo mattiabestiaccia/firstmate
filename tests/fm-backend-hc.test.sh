@@ -396,6 +396,12 @@ test_worker_names_do_not_change_routing() {
   assert_equals "$out" 'cm 🟧 t9-fix-login' 'ship name uses the exact address and id'
   out=$(hc_shell 'fm_backend_hc_worker_name scout t9 inspect-login')
   assert_equals "$out" 'sc 🟦 t9-inspect-login' 'scout name uses the scout role'
+  out=$(hc_shell 'fm_backend_hc_worker_name ship t9 fix-login correzione')
+  assert_equals "$out" 'cm 🟥 t9-fix-login' 'an explicit correction role is red'
+  out=$(hc_shell 'fm_backend_hc_worker_name ship t9 fix-login ""')
+  assert_equals "$out" 'cm 🟧 t9-fix-login' 'an empty role keeps the ordinary ship name'
+  expect_refused hc_shell 'fm_backend_hc_worker_name scout t9 inspect-login correzione'
+  expect_refused hc_shell 'fm_backend_hc_worker_name ship t9 fix-login debug'
   expect_refused hc_shell 'fm_backend_hc_worker_name debug t9 fix-login'
   expect_refused hc_shell 'fm_backend_hc_worker_name ship invalid fix-login'
   tag=$(hometag_of)

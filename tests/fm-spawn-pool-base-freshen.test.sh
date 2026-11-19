@@ -1135,6 +1135,49 @@ test_base_branch_must_agree_with_the_brief() {
   pass "a spawn refuses when --base-branch and the brief's Base branch lines disagree"
 }
 
+# --role correzione is an explicit display-only role: it is recorded for a ship
+# and nowhere else, and a spawn without it records nothing.
+test_role_flag_is_recorded_only_when_explicit() {
+  local rec id out status
+  id='pool-role-ship-r1'
+  rec=$(make_case role-ship "$id")
+  read_case_record "$rec"
+  fm_test_spawn_brief "$HOME_DIR" "$id"
+  out=$(run_spawn "$id" --mode direct-PR --yolo off --role correzione)
+  status=$?
+  expect_code 0 "$status" "a ship spawn with --role correzione should launch"$'\n'"$out"
+  assert_grep 'role=correzione' "$HOME_DIR/state/$id.meta" "the ship spawn did not record its role"
+
+  id='pool-role-none-r1'
+  rec=$(make_case role-none "$id")
+  read_case_record "$rec"
+  fm_test_spawn_brief "$HOME_DIR" "$id"
+  out=$(run_spawn "$id" --mode direct-PR --yolo off)
+  status=$?
+  expect_code 0 "$status" "a ship spawn without --role should launch"$'\n'"$out"
+  assert_no_grep 'role=' "$HOME_DIR/state/$id.meta" "a spawn without --role recorded a role"
+
+  id='pool-role-scout-r1'
+  rec=$(make_case role-scout "$id")
+  read_case_record "$rec"
+  fm_test_spawn_brief "$HOME_DIR" "$id"
+  out=$(run_spawn "$id" --scout --role correzione)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a scout spawn with --role was accepted"
+  assert_contains "$out" "--role applies only to ship spawns" "the scout refusal did not name the flag"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "a refused --role scout spawn published task metadata"
+
+  id='pool-role-bad-r1'
+  rec=$(make_case role-bad "$id")
+  read_case_record "$rec"
+  fm_test_spawn_brief "$HOME_DIR" "$id"
+  out=$(run_spawn "$id" --mode direct-PR --yolo off --role debug)
+  status=$?
+  [ "$status" -ne 0 ] || fail "an unknown --role value was accepted"
+  assert_contains "$out" "--role must be correzione (got 'debug')" "the value refusal did not name the allowed role"
+  pass "--role correzione is recorded for a ship only, refused for scouts and unknown values"
+}
+
 # A Base branch line quoted in the captain's intent is prose: it neither blocks
 # a spawn nor redirects it.
 test_prose_base_branch_line_is_ignored() {
@@ -1389,6 +1432,7 @@ test_stale_pool_base_refreshes_before_branching
 test_named_base_branch_starts_from_that_branch
 test_base_branch_must_agree_with_the_brief
 test_prose_base_branch_line_is_ignored
+test_role_flag_is_recorded_only_when_explicit
 test_scout_base_branch_refused_on_gerrit_forge
 test_non_main_default_branch_refreshes_before_branching
 test_direct_pr_and_scout_refresh_before_launch

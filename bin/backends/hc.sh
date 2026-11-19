@@ -299,12 +299,14 @@ fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
 
 # Presentation is separate from routing: neither tab names nor native agent
 # session names are endpoint handles. Only ship/scout have a registered kind;
-# correction/debug coloring requires an explicit role field, never an id guess.
-fm_backend_hc_worker_name() {  # <kind> <address> <task-id>
+# correction coloring requires the explicit role recorded by fm-spawn --role,
+# never an id or model guess. An empty role keeps the ordinary name.
+fm_backend_hc_worker_name() {  # <kind> <address> <task-id> [role]
   fm_backend_hc_address_valid "$2" || return 1
-  case "$1" in
-    ship) printf 'cm 🟧 %s-%s' "$2" "$3" ;;
-    scout) printf 'sc 🟦 %s-%s' "$2" "$3" ;;
+  case "$1:${4:-}" in
+    ship:) printf 'cm 🟧 %s-%s' "$2" "$3" ;;
+    ship:correzione) printf 'cm 🟥 %s-%s' "$2" "$3" ;;
+    scout:) printf 'sc 🟦 %s-%s' "$2" "$3" ;;
     *) return 1 ;;
   esac
 }

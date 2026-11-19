@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--dispatch-override <reason>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--role correzione] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--dispatch-override <reason>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--dispatch-override <reason>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
@@ -50,6 +50,13 @@
 #   prints a one-line deviation notice and continues, because the registered
 #   prefix is the captain's standing preference and the brief agreement above
 #   already guarantees the worker's instructions match the branch.
+#   --role correzione is the optional, explicit role of a fix, debug, or review
+#   ship. It is display-only: the spawn records role=correzione in
+#   state/<id>.meta (a relaunch reuses it) and the hc backend names and colors
+#   the worker red instead of orange. Nothing infers it from the model or
+#   effort, so a ship without the flag is named and colored exactly as before.
+#   It is refused on scouts, secondmates, and relaunches, and for any value
+#   other than correzione.
 #   --base-branch is the optional branch selected at intake for a ship or scout
 #   to start from and target instead of origin's default branch. A fresh launch
 #   resets its pooled copy to origin/<branch>, refusing when the project has no
@@ -1021,6 +1028,8 @@ BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
 BRANCH_PREFIX_SET=0
+ROLE=
+ROLE_SET=0
 BASE_BRANCH=
 BASE_BRANCH_SET=0
 UPSTREAM_CONSENT=
@@ -1075,6 +1084,10 @@ for a in "$@"; do
     branch-prefix)
       BRANCH_PREFIX=$a
       BRANCH_PREFIX_SET=1
+      ;;
+    role)
+      ROLE=$a
+      ROLE_SET=1
       ;;
     base-branch)
       BASE_BRANCH=$a
@@ -1150,6 +1163,11 @@ for a in "$@"; do
     BRANCH_PREFIX=${a#--branch-prefix=}
     BRANCH_PREFIX_SET=1
     ;;
+  --role) want_value=role ;;
+  --role=*)
+    ROLE=${a#--role=}
+    ROLE_SET=1
+    ;;
   --base-branch) want_value="base-branch" ;;
   --base-branch=*)
     BASE_BRANCH=${a#--base-branch=}
@@ -1207,6 +1225,10 @@ fi
 }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || {
   echo "error: --yolo requires a non-empty value" >&2
+  exit 1
+}
+[ "$ROLE_SET" -eq 0 ] || [ "$ROLE" = correzione ] || {
+  echo "error: --role must be correzione (got '$ROLE'); omit the flag for an ordinary ship" >&2
   exit 1
 }
 [ "$UPSTREAM_CONSENT_SET" -eq 0 ] || [ -n "$UPSTREAM_CONSENT" ] || {
@@ -1277,6 +1299,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: --relaunch reuses the task's recorded base branch; --base-branch cannot override it" >&2
     exit 1
   }
+  [ "$ROLE_SET" -eq 0 ] || {
+    echo "error: --relaunch reuses the task's recorded role; --role cannot override it" >&2
+    exit 1
+  }
   [ "$UPSTREAM_CONSENT_SET" -eq 0 ] || {
     echo "error: --relaunch reuses the task's recorded upstream consent; --upstream-consent cannot override it" >&2
     exit 1
@@ -1335,6 +1361,10 @@ else
     }
     [ "$BRANCH_PREFIX_SET" -eq 0 ] || {
       echo "error: --branch-prefix applies only to ship spawns; a scout makes no branch and a secondmate records no ship branch" >&2
+      exit 1
+    }
+    [ "$ROLE_SET" -eq 0 ] || {
+      echo "error: --role applies only to ship spawns; a scout or secondmate has no correction role" >&2
       exit 1
     }
     [ "$KIND" != secondmate ] || [ "$BASE_BRANCH_SET" -eq 0 ] || {
@@ -2190,6 +2220,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ "$YOLO_SET" -eq 0 ] || shared_args+=(--yolo "$YOLO")
   [ "$BRANCH_PREFIX_SET" -eq 0 ] || shared_args+=(--branch-prefix "$BRANCH_PREFIX")
   [ "$BASE_BRANCH_SET" -eq 0 ] || shared_args+=(--base-branch "$BASE_BRANCH")
+  [ "$ROLE_SET" -eq 0 ] || shared_args+=(--role "$ROLE")
   [ "$HERDR_RESUME_LOCK_WAIT" -eq 0 ] || shared_args+=(--herdr-resume-lock-wait)
   [ "$ACCOUNT_SET" -eq 0 ] || shared_args+=(--account "$ACCOUNT_ARG")
   for pair in "${POS[@]}"; do
@@ -2610,6 +2641,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
   UPSTREAM_CONSENT=$(fm_meta_get "$RELAUNCH_META" upstream_consent)
+  ROLE=$(fm_meta_get "$RELAUNCH_META" role)
   if [ "$KIND" = ship ]; then
     BRANCH=$(fm_meta_get "$RELAUNCH_META" branch)
     [ -n "$BRANCH" ] || BRANCH="fm/$ID"
@@ -7393,7 +7425,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx treehouse_lease_holder treehouse_lease_id handoff_wiring_hash polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent role forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx treehouse_lease_holder treehouse_lease_id handoff_wiring_hash polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7424,6 +7456,8 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   [ -z "$BASE_BRANCH" ] || echo "base_branch=$BASE_BRANCH"
   [ -z "$UPSTREAM_CONSENT" ] || echo "upstream_consent=$UPSTREAM_CONSENT"
+  # Display-only role (hc worker name and color); absent unless --role was given.
+  [ -z "$ROLE" ] || echo "role=$ROLE"
   # Read by bin/fm-dod-lib.sh's ready-report gate; absent on every other forge.
   [ "$EXTERNAL_REVIEW" = 0 ] || echo "forge=external"
   [ -z "$EXTERNAL_BACKUP_REMOTE" ] || echo "backup_remote=$EXTERNAL_BACKUP_REMOTE"
@@ -7613,9 +7647,10 @@ WORKER_NAME_FLAG=
 CLAUDE_LAUNCH_BIN=claude
 if [ "$BACKEND" = hc ] && [ "$KIND" != secondmate ]; then
   fm_backend_hc_parse_target "$T" || exit 1
-  WORKER_DISPLAY_NAME=$(fm_backend_hc_worker_name "$KIND" "$FM_BACKEND_HC_ADDRESS" "$ID") || exit 1
+  WORKER_DISPLAY_NAME=$(fm_backend_hc_worker_name "$KIND" "$FM_BACKEND_HC_ADDRESS" "$ID" "$ROLE") || exit 1
   WORKER_NAME_FLAG=" --name $(shell_quote "$WORKER_DISPLAY_NAME") "
   case "$KIND" in scout) WORKER_DISPLAY_COLOR=blue ;; *) WORKER_DISPLAY_COLOR=orange ;; esac
+  [ "$ROLE" != correzione ] || WORKER_DISPLAY_COLOR=red
   if [ "$HARNESS" = claude ]; then
     CLAUDE_LAUNCH_BIN="python3 $(shell_quote "$SCRIPT_DIR/fm-worker-claude.py") $(shell_quote "$WORKER_DISPLAY_NAME") $WORKER_DISPLAY_COLOR --"
   fi
