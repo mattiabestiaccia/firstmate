@@ -227,7 +227,23 @@ test_matrix_claude_named_session_titled_rule() {
   # composer, even with a live idle pi identity.
   assert_screen "titled pair over a blank row is not pi" unknown "$CAPS_STYLED" \
     "transcript"$'\n'"$titled"$'\n\n'"$rule"$'\n footer' '' "$pi_idle"
-  pass "matrix: a named claude session's titled top rule proves its composer; pi stays unchanged"
+  # Worker squares are two cells even though bash's UTF-8 length is one.
+  # hc has neither styled capture nor native identity; no capability upgrade
+  # is needed to prove a named rule sandwich around an agent prompt.
+  local worker named_rule plain_rule
+  plain_rule='────────────────────────────────────────'
+  for worker in 'cm 🟧 t9-task' 'sc 🟦 t9-task' 'cm 🟥 t9-task'; do
+    named_rule="──────────────────────── $worker ─"
+    assert_screen "hc worker title $worker" empty "$CAPS_PLAIN" \
+      "$named_rule"$'\n❯ \n'"$plain_rule"
+    assert_screen "hc worker draft without styling $worker" unknown "$CAPS_PLAIN" \
+      "$named_rule"$'\n❯ keep this draft\n'"$plain_rule"
+    assert_screen "hc worker wrong width $worker" unknown "$CAPS_PLAIN" \
+      "$named_rule"$'\n❯ \n'"${plain_rule}─"
+  done
+  assert_screen 'unproven unicode title' unknown "$CAPS_PLAIN" \
+    '────────────────────────── cm 猫 t9-task ─'$'\n❯ \n'"$plain_rule"
+  pass "matrix: named claude rules support worker-role squares without changing pi or accepting unknown widths"
 }
 
 test_matrix_claude_arrow_statusline_footer() {

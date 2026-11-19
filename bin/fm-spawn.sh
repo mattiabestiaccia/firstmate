@@ -2964,7 +2964,7 @@ launch_template() {
   # project and fetched content. A persistent secondmate receives its own
   # supervisor contract instead, so this task-worker statement does not apply.
   claude)
-    printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude __CLAUDEPERMFLAG__ __CLAUDEADDDIRS__--settings __CLAUDESETTINGS__ '
+    printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 __CLAUDEBIN__ __CLAUDEPERMFLAG__ __CLAUDEADDDIRS__--settings __CLAUDESETTINGS__ '
     if [ "$kind" != secondmate ]; then
       printf '%s' '__CLAUDEEXCLUDE__'
       printf '%s' "--append-system-prompt '$(spawn_claude_task_channel_statement)' "
@@ -3014,7 +3014,7 @@ launch_template() {
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}__EFFORTFLAG__}'\'' __OPENCODEBIN__ __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
   pi | pi-signed)
-    printf '%s' '__PIBIN____PITUIMODE____PIAPPROVE____PIEXCLUDE____PIRESUME__'
+    printf '%s' '__PIBIN____PITUIMODE____PIAPPROVE____PIEXCLUDE____PIRESUME____WORKERNAMEFLAG__'
     if [ "$kind" = secondmate ]; then
       # The two primary extensions supervise the mate's own home. __PIEXT__ is
       # the parent-home busy contract, loaded from outside the home so Pi's
@@ -7607,6 +7607,24 @@ fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
+# Display-only worker identity for Herdr Core. Other backends and secondmates
+# keep their existing launch behavior. Routing continues to use T/W and labels.
+WORKER_NAME_FLAG=
+CLAUDE_LAUNCH_BIN=claude
+if [ "$BACKEND" = hc ] && [ "$KIND" != secondmate ]; then
+  fm_backend_hc_parse_target "$T" || exit 1
+  WORKER_DISPLAY_NAME=$(fm_backend_hc_worker_name "$KIND" "$FM_BACKEND_HC_ADDRESS" "$ID") || exit 1
+  WORKER_NAME_FLAG=" --name $(shell_quote "$WORKER_DISPLAY_NAME") "
+  case "$KIND" in scout) WORKER_DISPLAY_COLOR=blue ;; *) WORKER_DISPLAY_COLOR=orange ;; esac
+  if [ "$HARNESS" = claude ]; then
+    CLAUDE_LAUNCH_BIN="python3 $(shell_quote "$SCRIPT_DIR/fm-worker-claude.py") $(shell_quote "$WORKER_DISPLAY_NAME") $WORKER_DISPLAY_COLOR --"
+  fi
+  if ! fm_backend_hc_worker_tab_name "$T" "$W" "$WORKER_DISPLAY_NAME"; then
+    echo "warning: could not name the Herdr.app tab for $ID; native session naming remains enabled; check herdr-app ls" >&2
+  fi
+fi
+LAUNCH=${LAUNCH//__CLAUDEBIN__/$CLAUDE_LAUNCH_BIN}
+LAUNCH=${LAUNCH//__WORKERNAMEFLAG__/$WORKER_NAME_FLAG}
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")

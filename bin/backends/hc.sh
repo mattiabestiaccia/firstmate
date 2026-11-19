@@ -297,6 +297,38 @@ fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
   printf '%s\n' "$address"
 }
 
+# Presentation is separate from routing: neither tab names nor native agent
+# session names are endpoint handles. Only ship/scout have a registered kind;
+# correction/debug coloring requires an explicit role field, never an id guess.
+fm_backend_hc_worker_name() {  # <kind> <address> <task-id>
+  fm_backend_hc_address_valid "$2" || return 1
+  case "$1" in
+    ship) printf 'cm 🟧 %s-%s' "$2" "$3" ;;
+    scout) printf 'sc 🟦 %s-%s' "$2" "$3" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Rename only the app tab bound to this home's task and the exact new address.
+# Adoption is asynchronous; a missing app is cosmetic, not a reason to discard
+# an allocated terminal. Never change firstmate.task/herdr.tab/herdr.space.
+fm_backend_hc_worker_tab_name() {  # <target> <window-label> <display-name>
+  local target=$1 label=$2 name=$3 scoped view attempt
+  fm_backend_hc_target_ready "$target" "$label" || return 1
+  command -v herdr-app >/dev/null 2>&1 || return 1
+  scoped=$(fm_backend_hc_scoped_label "$label")
+  for attempt in 1 2 3 4 5; do
+    view=$(herdr-app ls 2>/dev/null) || return 1
+    if printf '%s' "$view" | jq -e --arg tab "$scoped" --arg terminal "$FM_BACKEND_HC_ADDRESS" \
+      '[.spaces[]?.tabs[]? | select(.id == $tab) | .terminals[]? | select(.terminal == $terminal)] | length == 1' >/dev/null 2>&1; then
+      herdr-app 'do' tab.rename --id "$scoped" --name "$name" >/dev/null 2>&1
+      return $?
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 # fm_backend_hc_capture: the screen plus <lines> of history, the same window
 # tmux's `capture-pane -S -<lines>` returns.
 fm_backend_hc_capture() {  # <target> <lines> [expected-label]

@@ -389,7 +389,75 @@ test_required_tool_check_uses_the_adapter_resolver() {
   pass "hc: the bootstrap tool check resolves hc exactly as the adapter does"
 }
 
+test_worker_names_do_not_change_routing() {
+  local out tag
+  setup_case presentation
+  out=$(hc_shell 'fm_backend_hc_worker_name ship t9 fix-login')
+  assert_equals "$out" 'cm 🟧 t9-fix-login' 'ship name uses the exact address and id'
+  out=$(hc_shell 'fm_backend_hc_worker_name scout t9 inspect-login')
+  assert_equals "$out" 'sc 🟦 t9-inspect-login' 'scout name uses the scout role'
+  expect_refused hc_shell 'fm_backend_hc_worker_name debug t9 fix-login'
+  expect_refused hc_shell 'fm_backend_hc_worker_name ship invalid fix-login'
+  tag=$(hometag_of)
+  write_terminal "$D" t9 live fm-a1 "$tag" claude claude
+  cat > "$FB/herdr-app" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = ls ]; then
+  cat "$FAKE_HC_DIR/app.json"
+else
+  printf '%s\n' "$@" >> "$FAKE_HC_DIR/app.log"
+fi
+SH
+  chmod +x "$FB/herdr-app"
+  jq -n --arg tab "$tag-fm-a1" '{spaces:[{tabs:[{id:$tab,terminals:[{terminal:"t9"}]}]}]}' > "$D/app.json"
+  hc_shell 'fm_backend_hc_worker_tab_name fmtest:t9 fm-a1 "cm 🟧 t9-a1"' || fail 'owned tab rename failed'
+  assert_equals "$(< "$D/app.log")" $'do\ntab.rename\n--id\n'"$tag-fm-a1"$'\n--name\ncm 🟧 t9-a1' 'rename uses stable tab id and separate display name'
+  rm "$D/app.log"
+  jq -n --arg tab "$tag-fm-a1" '{spaces:[{tabs:[{id:$tab,terminals:[{terminal:"t8"}]}]}]}' > "$D/app.json"
+  expect_refused hc_shell 'fm_backend_hc_worker_tab_name fmtest:t9 fm-a1 "cm 🟧 t9-a1"'
+  [ ! -e "$D/app.log" ] || fail 'a tab bound to another terminal must not be renamed'
+  assert_not_contains "$(< "$D/log")" 'label' 'presentation never writes routing labels'
+  pass 'hc: role display names and tab renaming are independent of routing labels'
+}
+
+test_claude_color_is_local_before_interactive_launch() {
+  setup_case claude-presentation
+  cat > "$FB/claude" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['FAKE_HC_DIR'] + '/claude.log', 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\n')
+if '--print' in sys.argv:
+    if os.environ.get('FAIL_COLOR'):
+        sys.exit(1)
+    print('Session color set to: orange')
+PY
+  chmod +x "$FB/claude"
+  FAKE_HC_DIR=$D PATH="$FB:$PATH" python3 "$FM_TEST_ROOT/bin/fm-worker-claude.py" 'cm 🟧 t9-a1' orange -- --settings '{}' brief || fail 'Claude presentation launch failed'
+  if ! python3 - "$D/claude.log" <<'PY'
+import json, sys
+seed, launch = [json.loads(line) for line in open(sys.argv[1])]
+def value(args, flag):
+    return args[args.index(flag) + 1]
+assert seed[-1] == '/color orange'
+assert json.loads(value(seed, '--settings')) == {'disableAllHooks': True}
+assert value(seed, '--max-budget-usd') == '0.000001'
+assert value(seed, '--name') == value(launch, '--name') == 'cm 🟧 t9-a1'
+assert value(seed, '--session-id') == value(launch, '--resume')
+assert launch[-3:] == ['--settings', '{}', 'brief']
+PY
+  then
+    fail 'Claude seed/resume contract failed'
+  fi
+  : > "$D/claude.log"
+  expect_refused env FAIL_COLOR=1 FAKE_HC_DIR="$D" PATH="$FB:$PATH" python3 "$FM_TEST_ROOT/bin/fm-worker-claude.py" named orange -- brief
+  assert_equals "$(wc -l < "$D/claude.log" | tr -d ' ')" 1 'failed color setup must not launch the interactive worker'
+  pass 'Claude: native local color command initializes the same named session before launch'
+}
+
 fm_test_run \
+  test_worker_names_do_not_change_routing \
+  test_claude_color_is_local_before_interactive_launch \
   test_hc_is_spawn_capable_and_needs_app_signals \
   test_required_tool_check_uses_the_adapter_resolver \
   test_create_task_is_independent_labeled_and_refuses_duplicates \

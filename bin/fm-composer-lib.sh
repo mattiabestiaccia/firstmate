@@ -976,9 +976,9 @@ _fm_composer_pi_separator_row() {  # <trimmed-row>
 # The row must OPEN with the same 8-column dash run the strict separator
 # requires. Width is proven by comparing canonical space strings, never by
 # `${#row}`, which counts characters under UTF-8 and bytes under LC_ALL=C
-# (issue #1988). Title text is ASCII-printable only, the same boundary
-# _fm_composer_titled_bottom_ok holds; any other glyph leaves residue, and the
-# verdict stays `unknown`, the safe direction.
+# (issue #1988). Title text is ASCII-printable, plus the three worker-role
+# squares (each two terminal columns). Other Unicode leaves residue and keeps
+# the verdict unknown; Pi's strict separator remains unchanged.
 _fm_composer_titled_rule_row() {  # <trimmed-row> <plain-rule-spaces>
   local row=$1 expected=$2 spaces
   case "$row" in
@@ -986,6 +986,9 @@ _fm_composer_titled_rule_row() {  # <trimmed-row> <plain-rule-spaces>
     *) return 1 ;;
   esac
   spaces=${row//─/ }
+  spaces=${spaces//🟧/  }
+  spaces=${spaces//🟦/  }
+  spaces=${spaces//🟥/  }
   spaces=$(printf '%s' "$spaces" | LC_ALL=C sed 's/[!-~]/ /g')
   case "$spaces" in
     *[![:space:]]*) return 1 ;;

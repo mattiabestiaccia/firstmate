@@ -165,6 +165,18 @@ check_harness_idle_cursorless() {  # <name> <version> <target>
     CHECKED=$((CHECKED + 1))
     pass "$name ($version): the same idle pane read cursorless is not pending (verdict: $verdict)"
   fi
+  if [ "${CMX_REQUIRE_PLAIN_EMPTY:-0}" = 1 ]; then
+    caps=$(printf 'styled=0\ncursor=0\nidentity=0\nrows=0')
+    verdict=$(fm_composer_classify_screen "$caps" "$pane")
+    if [ "$verdict" = empty ]; then
+      CHECKED=$((CHECKED + 1))
+      pass "$name ($version): worker title remains empty without styling, cursor or identity"
+    else
+      FAILED=1
+      printf 'not ok - %s (%s): worker title without styling/cursor/identity reads %s, expected empty\n' \
+        "$name" "$version" "$verdict" >&2
+    fi
+  fi
 }
 
 # --- 1. Every installed verified harness must reach a proven-empty composer --
@@ -180,6 +192,10 @@ done
 # away-mode delivery to a named primary on a cursorless backend defers forever.
 if command -v claude >/dev/null 2>&1; then
   CMX_REQUIRE_CURSORLESS_EMPTY=1 check_harness_idle_empty claude-named claude -n fm-cmx-named
+  for worker_role in 'cm 🟧' 'sc 🟦' 'cm 🟥'; do
+    CMX_REQUIRE_CURSORLESS_EMPTY=1 CMX_REQUIRE_PLAIN_EMPTY=1 \
+      check_harness_idle_empty claude-worker-named claude -n "$worker_role t9-example-task"
+  done
 else
   note "harness absent, not verified here: claude-named"
 fi
