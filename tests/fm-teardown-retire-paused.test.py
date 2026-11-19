@@ -157,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
    continue
   (h.H/'hc-rm-fail').write_text('')
   before_refusal=h.snapshot();r=h.teardown('--force','--skip-orphan-sweep')
-  assert r.returncode==1 and 'before returning its copy' in r.stderr,r.stderr
+  assert r.returncode==1 and 'could not be closed before returning its copy' in r.stderr,r.stderr
   after_refusal=h.snapshot();before_refusal.pop('hc.log');after_refusal.pop('hc.log')
   assert before_refusal==after_refusal,'close failure changed copy or durable records'
   (h.H/'hc-rm-fail').unlink()
@@ -238,7 +238,7 @@ with tempfile.TemporaryDirectory(prefix='fm-retire-paused-') as tmp:
  h=Home(tmp,'close-fails-before-return',paused=None)
  (h.H/'hc-rm-fail').write_text('')
  r=h.teardown('--force','--skip-orphan-sweep')
- assert r.returncode==1 and 'before returning its copy' in r.stderr,r.stderr
+ assert r.returncode==1 and 'could not be closed before returning its copy' in r.stderr,r.stderr
  assert h.meta.exists() and (h.H/'hc'/(TERMINAL+'.json')).exists()
  assert not any(l.startswith('return ') for l in (h.H/'treehouse.log').read_text().splitlines())
  h=Home(tmp,'close-before-return',paused=None)

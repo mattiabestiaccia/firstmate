@@ -4081,7 +4081,7 @@ if [ "$KIND" != secondmate ] && [ "$TEARDOWN_WINDOWLESS" != 1 ] \
         }
       fi
       fm_backend_kill "$BACKEND" "$T" "" "fm-$ID" || {
-        echo "error: could not close $BACKEND endpoint $T before returning its copy; retaining task records" >&2
+        echo "error: $BACKEND endpoint $T for $ID could not be closed before returning its copy; retaining task records" >&2
         exit 1
       }
       TEARDOWN_ENDPOINT_CLOSED=1
