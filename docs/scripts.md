@@ -57,6 +57,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-guard.sh`            | Warn on primary-checkout tangles, main-session pending wakes, and unhealthy supervision |
 | `fm-primary-scope-lib.sh` | Shared marker-or-plain-checkout primary-home predicate for tracked hooks             |
 | `fm-session-lock-lib.sh` | Shared session-lock ownership from harness ancestry, a trusted Claude session id, or on Windows/Git Bash a published harness pid, for fm-lock.sh and the Claude Stop auto-arm, plus the reclaim verdict recovery callers apply, the ps-free identity fallback behind it, and the read-only lock inspection behind `fm-lock.sh status` and `fm-inbox.sh ready` |
+| `fm-session-readonly.sh` | Report, without side effects, whether the current session owns this home's session lock or runs read-only |
 | `fm-procinfo.py`         | Read one pid's ppid, comm, and args through macOS kernel syscalls when the `ps` binary cannot execute |
 | `fm-claude-stop-autoarm.sh` | Claude Stop/StopFailure `asyncRewake` hook; see [watcher continuity](watcher-continuity.md#claude-stop-hook) |
 | `fm-turnend-guard.sh`    | Shared primary turn-end guard predicate so no turn ends blind (docs/turnend-guard.md) |
@@ -147,6 +148,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-lease.sh`            | Claim, release, inspect, and sweep per-task supervision leases                       |
 | `fm-lease-lib.sh`        | One owner of the supervision lease contract and the main-only role-partition guards  |
 | `fm-control.sh`          | Agent lifecycle control plane: allowlisted `interrupt`, `exit`, and transactional `relaunch` verbs for an exact task id ([agent-control.md](agent-control.md)) |
+| `fm-lifecycle`           | Allowlisted gate the primary session runs outside its sandbox to reach `fm-spawn.sh`, `fm-control.sh`, and `fm-teardown.sh`, with explicit model and effort resolved from `config/crew-dispatch.json` |
 | `fm-control-lib.sh`      | One executable owner of the control-plane verb allowlist, per-harness interrupt/exit mechanics, per-backend capability, and the endpoint-absence proof both `exit` and `relaunch` read |
 | `fm-busy-lib.sh`         | Single owner of the semantic busy-state contract: verdicts, source attribution, per-harness sources, and the optional Pi model-stream evidence and ordering contract |
 | `fm-busy-event.sh`       | The only writer of task busy and progress evidence under the contract in `fm-busy-lib.sh`; its header and help own lifecycle and optional stream operations |

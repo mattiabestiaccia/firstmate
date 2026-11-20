@@ -1515,6 +1515,12 @@ families_for_changed_path() {
       printf '%s\n' real-herdr-gated
       printf '%s\n' backend-dispatch
       ;;
+    bin/fm-lifecycle|tests/fm-lifecycle-dispatch.test.py|bin/fm-session-readonly.sh|\
+    .pi/extensions/isolated-web-research.ts)
+      # Fork-local files with no suite in this runner's lanes: fm-lifecycle is
+      # proven by running its Python suite directly, and the other two have no
+      # tests/*.test.sh consumer. Mapped to nothing so --changed does not refuse.
+      ;;
     tests/*.test.sh)
       # A single test file change selects only that script via basename family
       # resolution in the caller; emit a marker family of __script__

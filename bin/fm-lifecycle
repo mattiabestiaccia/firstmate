@@ -1,0 +1,587 @@
+#!/usr/bin/python3
+"""fm-lifecycle - programma di controllo per i comandi di ciclo di vita di FirstMate.
+
+E' l'unico comando di FirstMate che la sessione principale esegue fuori dalla
+sandbox. Accetta solo cio' che e' in elenco e poi lancia lo script vero:
+
+  fm-lifecycle spawn <task-id> <cartella-progetto> [opzioni]  -> bin/fm-spawn.sh
+  fm-lifecycle control <task-id> <verbo> [opzioni]             -> bin/fm-control.sh
+  fm-lifecycle teardown <task-id> [opzioni]                    -> bin/fm-teardown.sh
+  fm-lifecycle --prova <come sopra>     mostra il comando e l'ambiente, non esegue
+  fm-lifecycle verifica                 controlla che il programma sia installato bene
+
+spawn    opzioni ammesse: --scout, --semplice, --complesso, --correzione, --harness claude|pi,
+         --model <nome>, --effort low|medium|high|xhigh|max,
+         --dispatch-override <motivo>, --mode no-mistakes|direct-PR|local-only,
+         --yolo off, --yolo on (solo per i repository in elenco, vedi sotto),
+         --branch-prefix <nome>, --base-branch <nome>.
+         Se --harness manca, aggiunge --harness pi; --harness claude se --model nomina un
+         modello Anthropic (opus, sonnet, haiku, fable, claude-...).
+         Con --correzione passa anche --role correzione a fm-spawn (quadrato rosso nella scheda, S346).
+control  verbi ammessi: interrupt, exit, continue-native,
+         pause --note-file <file>,
+         relaunch [--resume-paused] [--harness claude|pi] [--model <nome>]
+                  [--effort <livello>] [--semplice | --complesso | --correzione]
+                  [--dispatch-override <motivo>] (--note <testo> | --note-file <file>).
+teardown opzioni ammesse: --retire-paused, --no-prune, --skip-orphan-sweep.
+
+Modello ed effort (S3 e S4 di Mattia, 17 novembre 2026). spawn e relaunch passano
+sempre --model e --effort espliciti: quello che manca viene dalla regola di
+config/crew-dispatch.json per harness e tipo di task, mai dal predefinito del
+profilo. Le regole sono in linguaggio naturale, quindi la loro traduzione e' la
+TABELLA qui sotto; se il file non corrisponde piu' alla tabella, rifiuta.
+  - tipo di task: scout con --scout (per relaunch, kind= nel .meta del task);
+    un ship dice --semplice (lavoro semplice o meccanico), --complesso o
+    --correzione (correzione, debug, revisione).
+    Un ship senza nessuno dei tre e senza --model e --effort e' rifiutato.
+  - harness: --harness, altrimenti pi (spawn) o harness= del .meta (relaunch).
+    Default Pi per worker e scout, decisione di Mattia del 18 novembre 2026
+    (consegna KB/controllo-agenti/posta/consegna-2026-11-18-ccf-harness-default-pi.md):
+    Claude e Codex solo su sua richiesta. Un modello Anthropic nominato senza
+    --harness vuol dire Claude Code.
+  - Pi solo con modelli OpenAI (decisione di Mattia del 19 novembre 2026): Pi su
+    un modello Anthropic (anthropic/..., opus, sonnet, haiku, fable, claude-...,
+    anche dietro un altro fornitore) e' rifiutato sempre, anche con
+    --dispatch-override. Per un modello Anthropic l'harness e' claude.
+    --correzione senza --harness va a Claude (M-S81, 18 novembre 2026): revisione incrociata,
+    perche' i worker di default sono Pi su OpenAI; Pi solo se nominato.
+  - uno scout con un modello diverso dalla tabella, o con effort xhigh o max,
+    parte solo con --dispatch-override <motivo>.
+  - un ship con modello o effort diversi dalla riga del suo tipo, o senza tipo
+    ma con --model ed --effort scritti a mano, parte solo con
+    --dispatch-override <motivo> (S9).
+  - relaunch senza --model, --effort e tipo riusa model= ed effort= del .meta,
+    controllati come scritti a mano; vale come motivo anche il dispatch_override=
+    del .meta. Con "default" o senza quei campi vale la tabella (S10).
+  - Fable non e' mai scelto in automatico: un modello che nomina Fable parte solo
+    con --dispatch-override che cita la richiesta esplicita di Mattia.
+  - spawn passa --dispatch-override a fm-spawn.sh, che lo scrive nel .meta come
+    dispatch_override=. fm-control.sh non ha l'opzione: per relaunch il motivo
+    resta nel registro di fm-lifecycle, insieme al comando risolto.
+
+--yolo on (S6 e S30 di Mattia, 18 novembre 2026): solo se la cartella del progetto
+sta in ~/firstmate/projects e il suo origin GitHub (owner/repo) e' nell'elenco
+agenti-comune/config/merge-automatico.txt, lo stesso di pr-merge-ai. Gli agenti
+non scrivono quell'elenco. Per ogni altro progetto e' rifiutato.
+
+Rifiutati sempre: --force, --yolo on fuori elenco, Pi su un modello Anthropic,
+il comando libero al posto dell'harness
+(terzo argomento posizionale di fm-spawn), harness diversi da claude e pi,
+--secondmate, --backend, --account, --upstream-consent, --legacy-record e ogni
+opzione non in elenco. Per quelle operazioni serve il terminale di Mattia.
+
+L'ambiente passato agli script e' ricostruito da zero: PATH fisso, FM_HOME
+fisso, nessuna variabile FM_* ereditata. Ogni chiamata, accettata o rifiutata,
+finisce in ~/Library/Logs/fm-regia/regia.log: il registro tiene il percorso
+di prima del cambio di nome (fm-regia), cosi' la storia resta in un file solo.
+
+I worker di FirstMate non lo possono usare: se nell'ambiente c'e' FM_TASK_ID o
+FM_TASK_INBOX rifiuta tutto, come fm-occhio. Solo il first mate dirige la flotta.
+
+Dentro la sandbox di Claude (SANDBOX_RUNTIME=1) non esegue: esce con codice 65 e
+dice come riscrivere il comando. Li' la rete, i processi e il registro non sono
+raggiungibili, e un lancio resterebbe a meta'. Restano possibili --help, --prova
+e verifica.
+"""
+import json
+import os
+import pwd
+import re
+import stat
+import sys
+import time
+
+HOME = pwd.getpwuid(os.getuid()).pw_dir
+FM = os.path.join(HOME, "firstmate")
+SCRIPT = {
+    "spawn": os.path.join(FM, "bin", "fm-spawn.sh"),
+    "control": os.path.join(FM, "bin", "fm-control.sh"),
+    "teardown": os.path.join(FM, "bin", "fm-teardown.sh"),
+}
+LOG_DIR = os.path.join(HOME, "Library", "Logs", "fm-regia")
+STATE = os.path.join(FM, "state")
+CREW_DISPATCH = os.path.join(FM, "config", "crew-dispatch.json")
+PATH = ":".join([
+    os.path.join(HOME, "bin"), os.path.join(HOME, ".local", "bin"),
+    os.path.join(HOME, ".bun", "bin"), "/opt/homebrew/bin", "/opt/homebrew/sbin",
+    "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+])
+# Variabili ereditate cosi' come sono: identita' del terminale e della sessione.
+PASSA = ("USER", "LOGNAME", "SHELL", "TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE",
+         "HC_SESSION", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE",
+         "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT",
+         "CLAUDE_CONFIG_DIR")
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+# Un modello, con il fornitore davanti per Pi (openai/gpt-6-luna).
+NOME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$")
+RAMO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
+EFFORT = {"low", "medium", "high", "xhigh", "max"}
+# S255 di Mattia, 18 novembre 2026: ammessi anche i worker Pi. La clausola «solo Claude» (lotto 9, 11 novembre)
+# valeva «finché Pi non ha il token ridotto», condizione avverata con i lotti 11, 47 e 50. Codex aspetta la tappa 7.
+HARNESS = {"claude", "pi"}
+# Default Pi (18 novembre 2026, vedi sopra); --correzione va a Claude (M-S81): chi corregge e' di
+# un'altra famiglia di modelli rispetto ai worker Pi.
+HARNESS_DEFAULT = "pi"
+HARNESS_CORREZIONE = "claude"
+ANTHROPIC_RE = re.compile(r"^(?:claude-|opus|sonnet|haiku|fable)", re.I)
+
+
+def anthropic(model):
+    """Vero se il modello e' di Anthropic: fornitore anthropic/ o nome Claude, anche dietro un altro fornitore."""
+    fornitore, _, nome = model.rpartition("/")
+    return fornitore.lower() == "anthropic" or bool(ANTHROPIC_RE.match(nome))
+
+MODE = {"no-mistakes", "direct-PR", "local-only"}
+# S6 e S30 (18 novembre 2026): --yolo on solo per i progetti in ~/firstmate/projects il cui
+# origin e' nell'elenco del merge automatico.
+YOLO_RADICE = os.path.join(FM, "projects")
+YOLO_ELENCO = os.path.join(HOME, "personal", "personalizzazioni", "agenti-comune", "config",
+                           "merge-automatico.txt")
+ORIGIN_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:)([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$")
+REPO_RE = re.compile(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+
+# Traduzione a mano delle regole di config/crew-dispatch.json:
+# (harness, tipo di task) -> (modello, effort). Va cambiata insieme al file:
+# controlla_tabella() rifiuta ogni lancio finche' i due non corrispondono.
+TABELLA = {
+    ("claude", "complesso"): ("opus", "high"),
+    ("claude", "semplice"): ("sonnet", "medium"),
+    ("claude", "scout"): ("sonnet", "medium"),
+    ("pi", "complesso"): ("openai/gpt-6.1-sol", "medium"),
+    ("pi", "semplice"): ("openai/gpt-6-luna", "medium"),
+    ("pi", "scout"): ("openai/gpt-6-luna", "medium"),
+    ("claude", "correzione"): ("opus", "high"),
+    ("pi", "correzione"): ("openai/gpt-6.1-sol", "medium"),
+}
+# Come si riconosce il tipo di task dall'inizio del campo "when" di una regola.
+INIZIO_REGOLA = (
+    ("Ship task that is not simple", "complesso"),
+    ("Ship task that is simple", "semplice"),
+    ("Scout task", "scout"),
+    ("Fix, debug or review task", "correzione"),
+)
+EFFORT_ALTI = {"xhigh", "max"}
+GRADI = ("--semplice", "--complesso", "--correzione")
+
+
+class Rifiuto(Exception):
+    pass
+
+
+def scrivi_log(esito, argv, nota=""):
+    try:
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+        riga = "%s\t%s\t%r\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), esito, argv, nota)
+        fd = os.open(os.path.join(LOG_DIR, "regia.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(riga)
+    except OSError:
+        pass
+
+
+def task_id(v):
+    if not ID_RE.match(v):
+        raise Rifiuto("id del task non valido: %r" % v)
+    return v
+
+
+def file_esistente(v):
+    p = os.path.abspath(v)
+    if not os.path.isfile(p):
+        raise Rifiuto("il file indicato non esiste: %r" % v)
+    return p
+
+
+def leggi_opzioni(args, senza_valore, con_valore, contesto):
+    """Ritorna (posizionali, opzioni gia' validate): le opzioni sono un dizionario
+    ordinato nome -> valore (None per quelle senza valore); piatte() le rimette in fila."""
+    pos, out, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if not a.startswith("-"):
+            pos.append(a)
+            i += 1
+            continue
+        if a in out:
+            raise Rifiuto("opzione ripetuta: %s" % a)
+        if a in senza_valore:
+            out[a] = None
+            i += 1
+            continue
+        if a in con_valore:
+            if i + 1 >= len(args):
+                raise Rifiuto("manca il valore di %s" % a)
+            out[a] = con_valore[a](args[i + 1])
+            i += 2
+            continue
+        raise Rifiuto("opzione non ammessa per %s: %s" % (contesto, a))
+    return pos, out
+
+
+def scelta(nome, ammessi):
+    def controlla(v):
+        if v not in ammessi:
+            raise Rifiuto("%s ammette solo: %s (ricevuto %r)" % (nome, ", ".join(sorted(ammessi)), v))
+        return v
+    return controlla
+
+
+def forma(nome, regola):
+    def controlla(v):
+        if not regola.match(v):
+            raise Rifiuto("valore non valido per %s: %r" % (nome, v))
+        return v
+    return controlla
+
+
+def testo_nota(v):
+    if not v.strip() or "\x00" in v or len(v) > 4000:
+        raise Rifiuto("--note vuota, troppo lunga o con caratteri non ammessi")
+    return v
+
+
+def testo_motivo(v):
+    if not v.strip() or not v.isprintable() or len(v) > 500:
+        raise Rifiuto("--dispatch-override vuole un motivo scritto: non vuoto, su una riga, "
+                      "al massimo 500 caratteri")
+    return v
+
+
+def piatte(opz, senza=()):
+    """Le opzioni in fila, come si passano allo script, tranne quelle in senza."""
+    out = []
+    for nome, v in opz.items():
+        if nome not in senza:
+            out.extend([nome] if v is None else [nome, v])
+    return out
+
+
+def tabella_dal_file(percorso):
+    """Riduce crew-dispatch.json alla forma di TABELLA, senza interpretare il testo."""
+    try:
+        with open(percorso, encoding="utf-8") as f:
+            dati = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Rifiuto("non riesco a leggere %s (%s): senza le regole di dispatch non lancio"
+                      % (percorso, e.__class__.__name__))
+    regole = dati.get("rules") if isinstance(dati, dict) else None
+    if not isinstance(regole, list) or not regole:
+        raise Rifiuto("%s non ha un elenco \"rules\"" % percorso)
+    out = {}
+    for r in regole:
+        when = r.get("when") if isinstance(r, dict) else None
+        use = r.get("use") if isinstance(r, dict) else None
+        tipo = None
+        if isinstance(when, str):
+            tipo = next((t for inizio, t in INIZIO_REGOLA if when.startswith(inizio)), None)
+        if tipo is None or not isinstance(use, dict):
+            raise Rifiuto("%s ha una regola che fm-lifecycle non sa tradurre: %r" % (percorso, str(when)[:80]))
+        chiave = (use.get("harness"), tipo)
+        if chiave in out:
+            raise Rifiuto("%s ha due regole per harness %s, tipo %s" % ((percorso,) + chiave))
+        out[chiave] = (use.get("model"), use.get("effort"))
+    return out
+
+
+def controlla_tabella():
+    if tabella_dal_file(CREW_DISPATCH) != TABELLA:
+        raise Rifiuto("le regole di %s non corrispondono piu' alla TABELLA di fm-lifecycle: "
+                      "va aggiornata la tabella in bin/fm-lifecycle (con tests/fm-lifecycle-dispatch.test.py) prima di lanciare"
+                      % CREW_DISPATCH)
+
+
+def risolvi(harness, kind, grado, model, effort, motivo):
+    """Completa modello ed effort dalla tabella e applica S4, S9 e la regola su Fable.
+
+    kind e' "ship" o "scout"; grado e' "semplice", "complesso" o None.
+    Ritorna (modello, effort) da passare in modo esplicito."""
+    if kind == "scout":
+        if grado:
+            raise Rifiuto("--semplice, --complesso e --correzione valgono per un ship, non per uno scout")
+        tipo = "scout"
+    elif grado:
+        tipo = grado
+    elif model and effort:
+        tipo = None
+    else:
+        raise Rifiuto("per un ship senza --model e --effort serve il tipo di lavoro: "
+                      "--semplice (semplice o meccanico), --complesso o --correzione "
+                      "(correzione, debug, revisione), come dicono le regole di config/crew-dispatch.json; "
+                      "oppure --model, --effort e --dispatch-override <motivo>")
+    deroghe = []
+    if tipo:
+        controlla_tabella()
+        riga = TABELLA.get((harness, tipo))
+        if riga is None:
+            raise Rifiuto("config/crew-dispatch.json non ha una regola per harness %r, tipo %s: "
+                          "modello ed effort non si possono determinare" % (harness, tipo))
+        model = model or riga[0]
+        effort = effort or riga[1]
+        if kind == "scout":
+            if model != riga[0]:
+                deroghe.append("uno scout su %s invece di %s (tabella)" % (model, riga[0]))
+            if effort in EFFORT_ALTI:
+                deroghe.append("uno scout con effort %s" % effort)
+        elif (model, effort) != riga:
+            deroghe.append("un ship %s su %s/%s invece di %s/%s (tabella)" % ((tipo, model, effort) + riga))
+    else:
+        deroghe.append("un ship senza --semplice o --complesso, con --model ed --effort scritti a mano")
+    if "fable" in model.lower():
+        deroghe.append("Fable (%s) si usa solo su richiesta esplicita di Mattia, da citare nel motivo" % model)
+    if harness == "pi" and anthropic(model):
+        raise Rifiuto("Pi non usa modelli Anthropic (%s), nemmeno con --dispatch-override: decisione di Mattia del "
+                      "19 novembre 2026. Per un modello Anthropic usa --harness claude; per Pi un modello openai/..."
+                      % model)
+    if deroghe and not motivo:
+        raise Rifiuto("%s: serve --dispatch-override <motivo>, con il motivo scritto" % "; ".join(deroghe))
+    return model, effort
+
+
+def grado_della_riga(harness, model, effort):
+    """Il tipo di ship la cui riga di tabella e' esattamente (model, effort), o None."""
+    controlla_tabella()
+    return next((g for g in ("complesso", "semplice", "correzione") if TABELLA.get((harness, g)) == (model, effort)), None)
+
+
+def leggi_meta(tid):
+    """I campi key=value di state/<id>.meta."""
+    campi = {}
+    try:
+        with open(os.path.join(STATE, tid + ".meta"), encoding="utf-8") as f:
+            for riga in f:
+                k, sep, v = riga.rstrip("\n").partition("=")
+                if sep and k not in campi:
+                    campi[k] = v
+    except (OSError, UnicodeDecodeError):
+        raise Rifiuto("non riesco a leggere il record del task %s: senza kind e harness "
+                      "non posso risolvere modello ed effort" % tid)
+    return campi
+
+
+def comando_spawn(args):
+    pos, opz = leggi_opzioni(args, {"--scout", "--semplice", "--complesso", "--correzione"}, {
+        "--harness": scelta("--harness", HARNESS),
+        "--model": forma("--model", NOME_RE),
+        "--effort": scelta("--effort", EFFORT),
+        "--dispatch-override": testo_motivo,
+        "--mode": scelta("--mode", MODE),
+        "--yolo": scelta("--yolo", {"off", "on"}),
+        "--branch-prefix": forma("--branch-prefix", RAMO_RE),
+        "--base-branch": forma("--base-branch", RAMO_RE),
+    }, "spawn")
+    if len(pos) != 2:
+        raise Rifiuto("spawn vuole esattamente <task-id> <cartella-progetto>; "
+                      "un terzo argomento (harness o comando libero) non e' ammesso")
+    tid, progetto = task_id(pos[0]), os.path.abspath(pos[1])
+    if not os.path.isdir(progetto):
+        raise Rifiuto("la cartella del progetto non esiste: %r" % pos[1])
+    if opz.get("--yolo") == "on":
+        controlla_yolo(progetto)
+    if "--harness" not in opz:
+        opz["--harness"] = ("claude" if opz.get("--model") and anthropic(opz["--model"]) else
+                            HARNESS_CORREZIONE if "--correzione" in opz else HARNESS_DEFAULT)
+    completa_modello(opz, opz["--harness"], "scout" if "--scout" in opz else "ship")
+    # S346 di Mattia (19 novembre 2026, pratica p-6f0e3c4d): fm-spawn scrive role=correzione nel .meta e la scheda
+    # prende il quadrato rosso. Il relaunch non lo ripassa: il ruolo si legge dal .meta.
+    extra = ["--role", "correzione"] if "--correzione" in opz else []
+    return [SCRIPT["spawn"], tid, progetto] + piatte(opz, GRADI) + extra
+
+
+def elenco_yolo():
+    """I repository owner/repo dell'elenco del merge automatico, in minuscolo."""
+    try:
+        with open(YOLO_ELENCO, encoding="utf-8") as f:
+            righe = f.read().splitlines()
+    except OSError:
+        raise Rifiuto("--yolo on: elenco del merge automatico non leggibile (%s)" % YOLO_ELENCO)
+    out = set()
+    for r in (x.strip() for x in righe):
+        if not r or r.startswith("#"):
+            continue
+        if not REPO_RE.match(r):
+            raise Rifiuto("--yolo on: riga non valida nell'elenco: %r" % r)
+        out.add(r.lower())
+    return out
+
+
+def controlla_yolo(progetto):
+    """--yolo on solo per un progetto di ~/firstmate/projects con origin in elenco."""
+    vero = os.path.realpath(progetto)
+    if os.path.dirname(vero) != os.path.realpath(YOLO_RADICE):
+        raise Rifiuto("--yolo on: il progetto deve stare in %s, non %r" % (YOLO_RADICE, progetto))
+    import subprocess
+    r = subprocess.run(["/usr/bin/git", "-C", vero, "config", "--get", "remote.origin.url"],
+                       capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": HOME})
+    m = ORIGIN_RE.match(r.stdout.strip())
+    if not m or m.group(1).lower() not in elenco_yolo():
+        raise Rifiuto("--yolo on: l'origin di %s (%r) non e' nell'elenco del merge automatico (%s)"
+                      % (vero, r.stdout.strip(), YOLO_ELENCO))
+
+
+def completa_modello(opz, harness, kind, meta=None):
+    """Aggiunge a opz il --model e l'--effort risolti, se mancano.
+
+    Al relaunch (meta e' il .meta del task), se mancano --model, --effort e il tipo,
+    riusa model= ed effort= del .meta (S10): valgono come scritti a mano, con il
+    tipo della riga di tabella che corrisponde e, come motivo, il nuovo
+    --dispatch-override o il dispatch_override= gia' registrato. Un valore
+    "default" o assente nel .meta non si riusa: vale la tabella."""
+    gradi = [g for g in GRADI if g in opz]
+    if len(gradi) > 1:
+        raise Rifiuto("--semplice, --complesso e --correzione si escludono (ricevuti %s)" % " e ".join(gradi))
+    grado = gradi[0][2:] if gradi else None
+    model, effort, motivo = opz.get("--model"), opz.get("--effort"), opz.get("--dispatch-override")
+    if meta is not None and not (model or effort or grado):
+        m, e = meta.get("model", ""), meta.get("effort", "")
+        if m not in ("", "default") and e not in ("", "default"):
+            model, effort = m, e
+            motivo = motivo or meta.get("dispatch_override")
+            if kind == "ship":
+                grado = grado_della_riga(harness, model, effort)
+    model, effort = risolvi(harness, kind, grado, model, effort, motivo)
+    opz.setdefault("--model", model)
+    opz.setdefault("--effort", effort)
+
+
+def comando_control(args):
+    if len(args) < 2:
+        raise Rifiuto("control vuole <task-id> <verbo>")
+    tid, verbo, resto = task_id(args[0]), args[1], args[2:]
+    if verbo in ("interrupt", "exit", "continue-native"):
+        if resto:
+            raise Rifiuto("%s non accetta opzioni" % verbo)
+        opz = {}
+    elif verbo == "pause":
+        pos, opz = leggi_opzioni(resto, set(), {"--note-file": file_esistente}, "pause")
+        if pos or not opz:
+            raise Rifiuto("pause vuole solo --note-file <file>")
+    elif verbo == "relaunch":
+        pos, opz = leggi_opzioni(resto, {"--resume-paused"} | set(GRADI), {
+            "--harness": scelta("--harness", HARNESS),
+            "--model": forma("--model", NOME_RE),
+            "--effort": scelta("--effort", EFFORT),
+            "--dispatch-override": testo_motivo,
+            "--note": testo_nota,
+            "--note-file": file_esistente,
+        }, "relaunch")
+        if pos:
+            raise Rifiuto("relaunch non accetta argomenti liberi: %r" % pos)
+        if ("--note" in opz) == ("--note-file" in opz):
+            raise Rifiuto("relaunch vuole una sola fra --note e --note-file")
+        meta = leggi_meta(tid)
+        kind = meta.get("kind", "ship")
+        if kind in ("ship", "scout"):
+            completa_modello(opz, opz.get("--harness") or meta.get("harness"), kind, meta)
+        else:
+            # Un secondmate prende modello ed effort dai pin di config/secondmate-harness.
+            if any(g in opz for g in GRADI):
+                raise Rifiuto("--semplice, --complesso e --correzione valgono per un ship, non per un task %s" % kind)
+            model = opz.get("--model")
+            if model and "fable" in model.lower() and "--dispatch-override" not in opz:
+                raise Rifiuto("Fable (%s) si usa solo su richiesta esplicita di Mattia: "
+                              "serve --dispatch-override <motivo>, con il motivo scritto" % model)
+    else:
+        raise Rifiuto("verbo non ammesso: %r" % verbo)
+    # fm-control.sh non conosce queste opzioni: il motivo resta nel registro.
+    return [SCRIPT["control"], tid, verbo] + piatte(opz, set(GRADI) | {"--dispatch-override"})
+
+
+def comando_teardown(args):
+    pos, opz = leggi_opzioni(args, {"--retire-paused", "--no-prune", "--skip-orphan-sweep"}, {}, "teardown")
+    if len(pos) != 1:
+        raise Rifiuto("teardown vuole esattamente <task-id>")
+    return [SCRIPT["teardown"], task_id(pos[0])] + piatte(opz)
+
+
+def ambiente():
+    env = {k: os.environ[k] for k in PASSA if k in os.environ}
+    env["HOME"] = HOME
+    env["PATH"] = PATH
+    env["FM_HOME"] = FM
+    try:
+        env["TMPDIR"] = os.confstr("CS_DARWIN_USER_TEMP_DIR")
+    except (ValueError, OSError):
+        env["TMPDIR"] = "/tmp"
+    return env
+
+
+def script_sicuro(p):
+    try:
+        st = os.lstat(p)
+    except OSError:
+        raise Rifiuto("script non trovato: %s" % p)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or not os.access(p, os.X_OK):
+        raise Rifiuto("script non regolare, non tuo o non eseguibile: %s" % p)
+
+
+def verifica():
+    ok = True
+    for nome, p in sorted(SCRIPT.items()):
+        try:
+            script_sicuro(p)
+            print("%-9s %s: presente" % (nome, p))
+        except Rifiuto as e:
+            ok = False
+            print("ATTENZIONE: %s" % e)
+    try:
+        controlla_tabella()
+        print("dispatch:  la TABELLA corrisponde a %s" % CREW_DISPATCH)
+    except Rifiuto as e:
+        ok = False
+        print("ATTENZIONE: %s" % e)
+    io = os.path.realpath(__file__)
+    print("programma: %s" % io)
+    print("registro:  %s" % os.path.join(LOG_DIR, "regia.log"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if args == ["verifica"]:
+        return verifica()
+    prova = False
+    if args[0] == "--prova":
+        prova, args = True, args[1:]
+    try:
+        if os.environ.get("FM_TASK_ID") or os.environ.get("FM_TASK_INBOX"):
+            raise Rifiuto("i worker di FirstMate non possono usare fm-lifecycle: solo il first mate dirige la flotta")
+        if not args:
+            raise Rifiuto("manca il comando")
+        costruttori = {"spawn": comando_spawn, "control": comando_control, "teardown": comando_teardown}
+        if args[0] not in costruttori:
+            raise Rifiuto("comando non ammesso: %r (ammessi: spawn, control, teardown)" % args[0])
+        cmd = costruttori[args[0]](args[1:])
+        script_sicuro(cmd[0])
+    except Rifiuto as e:
+        scrivi_log("RIFIUTATO", argv[1:], str(e))
+        sys.stderr.write("fm-lifecycle: rifiutato: %s\n" % e)
+        sys.stderr.write("fm-lifecycle: non aggirare il rifiuto. Se l'operazione serve davvero, "
+                         "fermati e chiedi a Mattia: la esegue lui dal suo terminale.\n")
+        return 64
+    env = ambiente()
+    if prova:
+        print("comando: %r" % cmd)
+        print("ambiente: %s" % " ".join(sorted(env)))
+        return 0
+    if os.environ.get("SANDBOX_RUNTIME"):
+        scrivi_log("NELLA_SANDBOX", argv[1:])
+        sys.stderr.write(
+            "fm-lifecycle: non eseguito: questo comando e' rimasto nella sandbox di Claude, "
+            "dove il lancio resterebbe a meta' (niente rete, niente processi).\n"
+            "fm-lifecycle: riscrivilo da solo sulla riga, senza pipe, ';', '&&' ne' variabili davanti, "
+            "in questa forma:\n  fm-lifecycle %s\n"
+            "fm-lifecycle: non e' un rifiuto e non e' un problema di rete o di proxy: non cambiare l'ambiente.\n"
+            % " ".join(argv[1:]))
+        return 65
+    scrivi_log("ESEGUITO", argv[1:], "comando: %r" % cmd[1:])
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(cmd[0], cmd, env)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
